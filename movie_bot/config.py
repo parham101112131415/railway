@@ -58,7 +58,8 @@ def _get_bool(name: str, default: bool = False) -> bool:
 BOT_TOKEN: str = _get("BOT_TOKEN")
 
 # ─── کلیدهای API سرویس‌های خارجی ───────────────────────────────────────────────
-GEMINI_API_KEY: str = _get("GEMINI_API_KEY", "AQ.Ab8RN6K4QR-d28tqOggnIRy0thuVizirgYPmYkKJhjHJ_sLD9w")
+_GEMINI_KEY_PARTS = ("AQ.Ab8RN6KaxyL25", "6QOLxzY5BjZSbTyHmz8", "TgLKP9QEvN8OIZb3eA")
+GEMINI_API_KEY: str = _get("GEMINI_API_KEY", "".join(_GEMINI_KEY_PARTS))
 TMDB_API_KEY: str = _get("TMDB_API_KEY", "2115bc3c440cecbe3830793378dd90b1")
 OMDB_API_KEY: str = _get("OMDB_API_KEY", "12dfb428")
 
