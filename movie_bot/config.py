@@ -35,8 +35,9 @@ load_dotenv(ENV_FILE, override=False)
 
 
 def _get(name: str, default: str = "") -> str:
-    """خواندن امن یک متغیر محیطی."""
-    return os.getenv(name, default).strip()
+    """خواندن امن یک متغیر محیطی (مقدار خالی = ست‌نشده، پیش‌فرض برمی‌گردد)."""
+    val = (os.getenv(name, default) or "").strip()
+    return val if val else default.strip()
 
 
 def _get_int(name: str, default: int) -> int:

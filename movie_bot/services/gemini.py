@@ -273,6 +273,10 @@ def _rest_generate(prompt: str, images: list[tuple[str, bytes]], model: str | No
         if resp is None:
             raise RuntimeError("هیچ مدل Gemini‌ای برای این کلید در دسترس نیست.")
 
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            "کلید GEMINI_API_KEY نامعتبر است؛ یک کلید تازه از AI Studio بگیر و بذار."
+        )
     if resp.status_code == 429:
         tail = (GEMINI_API_KEY or "")[-6:]
         raise QuotaExceededError(f"سهمیه رایگان Gemini تمام شده است. (کلید ختم‌شونده به …{tail})")
