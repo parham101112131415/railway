@@ -1,0 +1,12 @@
+python-telegram-bot>=21.0,<23.0
+yt-dlp[default]
+aiohttp
+curl_cffi
+mutagen
+ShazamAPI
+pydub
+SpeechRecognition
+requests
+numpy
+Pillow
+python-dotenv
