@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+downloads/
+.dl_queue.json
+.dl_cache.json
+*.json
+.git
+.gitignore
+README*.md
