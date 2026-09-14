@@ -5592,9 +5592,16 @@ async def run_single_job(update, ctx, job, queue_info=None):
                     print(f"[telegram-cache] ذخیره file_id ناموفق: {e}", flush=True)
                 print(f"[done] sent ok real_bps={real_bps:.0f} elapsed={elapsed:.1f}s", flush=True)
                 try:
-                    if getattr(cfg, "DELETE_AFTER_SEND", True) and path and os.path.isfile(path):
+                    # فایل‌های کاتالوگ اینستا (ریلز/آهنگ) برای «ساخت لینک» نگه داشته
+                    # می‌شن — پاک کردنشون بعد ارسال، لیست لینک رو همیشه خالی می‌کرد.
+                    _is_ig_keep = bool(job.get("ig_kind")) or bool(
+                        url and dl.is_instagram_url(url)
+                    )
+                    if (not _is_ig_keep) and getattr(cfg, "DELETE_AFTER_SEND", True) and path and os.path.isfile(path):
                         cleanup_path(path)
                         print(f"[cleanup] حذف فایل لوکال: {path}", flush=True)
+                    elif _is_ig_keep:
+                        print(f"[cleanup] نگه داشته شد برای لینک: {path}", flush=True)
                 except Exception as _ce:
                     print(f"[cleanup] {_ce}", flush=True)
                 try:
