@@ -264,8 +264,8 @@ def _rest_generate(prompt: str, images: list[tuple[str, bytes]], model: str | No
             tried.append(use_model)
             logger.info("Gemini مدل انتخاب‌شده: %s", use_model)
             resp = _post(use_model)
-            if resp.status_code == 404:
-                logger.warning("مدل %s در دسترس نیست (۴۰۴)؛ مدل بعدی امتحان می‌شود.", use_model)
+            if resp.status_code in (404, 503):
+                logger.warning("مدل %s در دسترس نیست (%s)؛ مدل بعدی امتحان می‌شود.", use_model, resp.status_code)
                 _mark_auto_model_bad(use_model)
                 continue
             _mark_auto_model_good(use_model)
@@ -280,6 +280,10 @@ def _rest_generate(prompt: str, images: list[tuple[str, bytes]], model: str | No
     if resp.status_code == 429:
         tail = (GEMINI_API_KEY or "")[-6:]
         raise QuotaExceededError(f"سهمیه رایگان Gemini تمام شده است. (کلید ختم‌شونده به …{tail})")
+    if resp.status_code >= 500:
+        raise RuntimeError(
+            f"سرور گوگل فعلاً در دسترس نیست ({resp.status_code})؛ چند دقیقه بعد دوباره امتحان کن."
+        )
     resp.raise_for_status()
     tree = resp.json()
     try:
