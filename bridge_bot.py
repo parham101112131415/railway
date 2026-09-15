@@ -5632,6 +5632,17 @@ async def run_single_job(update, ctx, job, queue_info=None):
                     )
                 except Exception:
                     pass
+                # فایلِ ارسال‌نشده هم نمونه تا volume پر نشه (به‌جز فایل اینستا
+                # که برای لینک‌های اشتراک نگه داشته می‌شه).
+                try:
+                    _is_ig_keep = bool((job or {}).get("ig_kind")) or bool(
+                        url and dl.is_instagram_url(url)
+                    )
+                    if (not _is_ig_keep) and getattr(cfg, "DELETE_AFTER_SEND", True) and path and os.path.isfile(path):
+                        cleanup_path(path)
+                        print(f"[cleanup] حذف فایل ارسال‌نشده: {path}", flush=True)
+                except Exception:
+                    pass
     else:
         try:
             await prog_msg.edit_text("❌ دانلود ناموفق بود.")
@@ -7330,11 +7341,54 @@ def stop_internal_tunnel():
         _xray_process = None
 
 
+def _sweep_stale_downloads():
+    """جاروی شروع ربات: فایل‌های قدیمی پوشه دانلود پاک می‌شن تا volume پر نشه.
+
+    فایل‌های کاتالوگ اینستا (برای لینک‌های اشتراک) دست نمی‌خورن؛ بقیه
+    (یوتیوب و...) که از CLEANUP_AFTER_HOURS ساعت قدیمی‌ترن حذف می‌شن.
+    """
+    try:
+        max_age = float(getattr(cfg, "CLEANUP_AFTER_HOURS", 6)) * 3600
+    except (TypeError, ValueError):
+        max_age = 6 * 3600
+    if max_age <= 0:
+        return
+    try:
+        keep = set()
+        for e in load_ig_catalog():
+            p = (e or {}).get("path")
+            if p:
+                keep.add(os.path.abspath(p))
+        ddir = getattr(cfg, "DOWNLOAD_DIR", None) or os.path.join(
+            getattr(cfg, "BASE_DIR", "/app"), "downloads")
+        now = time.time()
+        n, freed = 0, 0
+        for root, _dirs, files in os.walk(ddir):
+            for fn in files:
+                fp = os.path.abspath(os.path.join(root, fn))
+                if fp in keep:
+                    continue
+                try:
+                    if now - os.path.getmtime(fp) < max_age:
+                        continue
+                    freed += os.path.getsize(fp)
+                    os.remove(fp)
+                    n += 1
+                except Exception:
+                    pass
+        if n:
+            print(f"[sweep] {n} فایل قدیمی پاک شد ({freed/1048576:.0f}MB آزاد شد).", flush=True)
+    except Exception as exc:
+        print(f"[sweep] خطا: {exc}", flush=True)
+
+
 def main():
     # نسخه مستقیم: بدون تونل داخلی xray
     # ترافیک از VPN/فیلترشکن سیستم گوشی رد می‌شه
     for k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         os.environ.pop(k, None)
+
+    _sweep_stale_downloads()
 
     def build_app():
         from telegram.request import HTTPXRequest

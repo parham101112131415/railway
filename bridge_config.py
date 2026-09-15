@@ -45,3 +45,8 @@ SPLIT_CHUNK_BYTES = int(os.environ.get(
 
 # بعد از ارسال موفق، فایل لوکال پاک شود تا دیسک پر نشود
 DELETE_AFTER_SEND = os.environ.get("DELETE_AFTER_SEND", "1") != "0"
+
+# جاروی خودکار دیسک: فایل‌های دانلود قدیمی‌تر از این ساعت در شروع ربات پاک
+# می‌شن (به‌جز فایل‌های کاتالوگ اینستا که برای لینک‌های اشتراک نگه داشته می‌شن).
+# یوتیوب و بقیه بعد از ارسال هم پاک می‌شن، پس volume پر نمی‌شه.
+CLEANUP_AFTER_HOURS = float(os.environ.get("CLEANUP_AFTER_HOURS", "6"))
