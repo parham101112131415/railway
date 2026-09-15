@@ -5493,8 +5493,9 @@ async def run_single_job(update, ctx, job, queue_info=None):
                 audio_caption = job.get("caption") or (
                     f"🎵 {job.get('tag_title')}" if job.get("tag_title") else "✅ دانلود تمام شد"
                 )
-                # اگر بزرگ‌تر از ۵۰MB باشد با تقسیم ~۴۵MB ارسال کن
-                if sz > 50 * 1024 * 1024 and SPLIT_OK:
+                # اگر بزرگ‌تر از سقف تلگرام باشد با تقسیم ارسال کن
+                # (ابری: ۵۰MB — سرور محلی: ~۱۹۰۰MB، یعنی عملاً یک‌جا)
+                if sz > getattr(cfg, "TELEGRAM_MAX_BYTES", 50 * 1024 * 1024) and SPLIT_OK:
                     try:
                         await prog_msg.edit_text(
                             f"📦 فایل بزرگ ({sz/1048576:.1f} MB) — تقسیم و ارسال تکه‌های ~۴۵MB…"
@@ -7337,11 +7338,14 @@ def main():
 
     def build_app():
         from telegram.request import HTTPXRequest
+        # حالت سرور محلی Bot API (آپلود یک‌جای تا ~۲ گیگ): تایم‌اوت‌ها بلندتر.
+        _local = bool(getattr(cfg, "TELEGRAM_LOCAL_API", False))
+        _big = 1800.0 if _local else 15.0
         # تایم‌اوت بلندتر برای شبکه ضعیف ایران
         req = HTTPXRequest(
             connect_timeout=15.0,
-            read_timeout=15.0,
-            write_timeout=15.0,
+            read_timeout=_big,
+            write_timeout=_big,
             pool_timeout=15.0,
         )
         b = (
@@ -7351,6 +7355,9 @@ def main():
             .get_updates_request(req)
             .concurrent_updates(True)
         )
+        if _local:
+            _base = str(getattr(cfg, "LOCAL_API_URL", "http://127.0.0.1:8081")).rstrip("/")
+            b = b.base_url(f"{_base}/bot").base_file_url(f"{_base}/file/bot")
         a = b.build()
         owner_f = filters.User(user_id=list(cfg.OWNER_ID))
         a.add_handler(CommandHandler("start", start_cmd))

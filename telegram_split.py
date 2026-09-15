@@ -11,8 +11,20 @@ import os
 import asyncio
 import subprocess
 
-DEFAULT_CHUNK_BYTES = 45 * 1024 * 1024  # 45MB
-TELEGRAM_SAFE_LIMIT = 50 * 1024 * 1024  # 50MB
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+_LOCAL = os.environ.get("TELEGRAM_LOCAL_API", "0") == "1"
+# سرور محلی Bot API تا ~۲ گیگ یک‌جا می‌فرسته؛ ابری فقط ۵۰ مگ.
+DEFAULT_CHUNK_BYTES = _env_int(
+    "SPLIT_CHUNK_BYTES", 1900 * 1024 * 1024 if _LOCAL else 45 * 1024 * 1024)
+TELEGRAM_SAFE_LIMIT = _env_int(
+    "TELEGRAM_MAX_BYTES", 1900 * 1024 * 1024 if _LOCAL else 50 * 1024 * 1024)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".ogg", ".aac", ".wav", ".flac"}

@@ -32,9 +32,16 @@ APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "apify_api_piDgZl07Z3DCaihmw
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 YOUTUBE_DATA_API_KEY = os.environ.get("YOUTUBE_DATA_API_KEY", "AIzaSyCQpfcVpwpZg_glpZZWccb7Q-1vYHcER-s")
 
-# محدودیت تلگرام برای ربات: ۵۰ مگ — تکه‌ها را حدود ۴۵ مگ می‌فرستیم
-TELEGRAM_MAX_BYTES = int(os.environ.get("TELEGRAM_MAX_BYTES", 50 * 1024 * 1024))
-SPLIT_CHUNK_BYTES = int(os.environ.get("SPLIT_CHUNK_BYTES", 45 * 1024 * 1024))
+# محدودیت تلگرام برای ربات: ۵۰ مگ — تکه‌ها را حدود ۴۵ مگ می‌فرستیم.
+# اگه TELEGRAM_LOCAL_API=1 باشه (سرور محلی Bot API)، سقف میره تا ~۱۹۰۰ مگ و
+# فایل‌ها یک‌جا و کامل ارسال می‌شن (مثل NextSaverBot) — بدون تکه‌تکه.
+TELEGRAM_LOCAL_API = os.environ.get("TELEGRAM_LOCAL_API", "0") == "1"
+LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "http://127.0.0.1:8081").rstrip("/")
+_LOCAL_MAX = 1900 * 1024 * 1024
+TELEGRAM_MAX_BYTES = int(os.environ.get(
+    "TELEGRAM_MAX_BYTES", _LOCAL_MAX if TELEGRAM_LOCAL_API else 50 * 1024 * 1024))
+SPLIT_CHUNK_BYTES = int(os.environ.get(
+    "SPLIT_CHUNK_BYTES", _LOCAL_MAX if TELEGRAM_LOCAL_API else 45 * 1024 * 1024))
 
 # بعد از ارسال موفق، فایل لوکال پاک شود تا دیسک پر نشود
 DELETE_AFTER_SEND = os.environ.get("DELETE_AFTER_SEND", "1") != "0"
