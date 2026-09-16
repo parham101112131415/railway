@@ -16,11 +16,12 @@ else:
 
 # دسترسی محدود: فقط ریلز اینستا → دانلود مستقیم + دکمه «پیدا کردن آهنگ».
 # بقیه‌ی فیچرها (کیفیت، فیلم‌یاب، لینک‌سازی، ...) براشون قفله.
+# (8905260615 موقتاً اضافه شده که پرهام ببینه راکی چی می‌بینه — بعد تست بردار!)
 _limited_env = os.environ.get("LIMITED_USER_IDS", "")
 if _limited_env.strip():
     LIMITED_USERS = {int(x) for x in _limited_env.replace(" ", "").split(",") if x}
 else:
-    LIMITED_USERS = {5341492953}
+    LIMITED_USERS = {5341492953, 8905260615}
 
 # مسیرها روی کانتینر Railway — پیش‌فرض داخل خود پروژه، همیشه قابل‌نوشتنه
 BASE_DIR = os.environ.get("BOT_BASE", "/app")
