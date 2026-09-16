@@ -14,6 +14,14 @@ if _owner_env.strip():
 else:
     OWNER_ID = {8055210419, 8905260615}
 
+# دسترسی محدود: فقط ریلز اینستا → دانلود مستقیم + دکمه «پیدا کردن آهنگ».
+# بقیه‌ی فیچرها (کیفیت، فیلم‌یاب، لینک‌سازی، ...) براشون قفله.
+_limited_env = os.environ.get("LIMITED_USER_IDS", "")
+if _limited_env.strip():
+    LIMITED_USERS = {int(x) for x in _limited_env.replace(" ", "").split(",") if x}
+else:
+    LIMITED_USERS = {5341492953}
+
 # مسیرها روی کانتینر Railway — پیش‌فرض داخل خود پروژه، همیشه قابل‌نوشتنه
 BASE_DIR = os.environ.get("BOT_BASE", "/app")
 DOWNLOADER_PATH = os.path.join(BASE_DIR, "downloader.py")

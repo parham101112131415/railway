@@ -8,6 +8,7 @@ import glob
 import json
 import time
 import asyncio
+import secrets
 import threading
 import traceback
 import subprocess
@@ -198,6 +199,19 @@ LYRICS_CACHE_MAX = 200
 # جلوگیری از اجرای دوباره‌ی همون جاب (لوپ دانلود/آپلودِ همون لینک)
 _LYRICS_BUSY = set()   # lyrics_id های در حال گرفتن متن
 _SONG_BUSY = {}        # (chat_id, url) -> True : فلوی «تشخیص آهنگ» در حال اجراست
+
+# کش «🎵 پیدا کردن آهنگ» زیر ویدیوهای کاربر محدود: {token: {"url":..., "inf":...}}
+FINDSONG_CACHE = {}
+FINDSONG_CACHE_MAX = 500
+# کال‌بک‌هایی که کاربر محدود اجازه داره بزنه (فقط مسیر پیدا کردن آهنگ)
+LIMITED_SONG_CB = ("findsong", "igms", "lyrics")
+
+
+def _is_limited(uid):
+    try:
+        return uid is not None and int(uid) in set(getattr(cfg, "LIMITED_USERS", ()) or ())
+    except Exception:
+        return False
 _MOVIE_BUSY = {}       # (chat_id, url) -> True : فلوی «شناسایی فیلم» در حال اجراست
 
 
@@ -3966,10 +3980,91 @@ async def show_share_catalog(update, ctx):
     )
 
 
+async def start_rocky_reel(update, ctx, url):
+    """کاربر محدود: بدون هیچ منویی، مستقیم دانلود ریلز با بهترین کیفیت + دکمه پیدا کردن آهنگ."""
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text("⏳ در حال دانلود با بهترین کیفیت...")
+    try:
+        inf = await asyncio.wait_for(asyncio.to_thread(dl.info, url), timeout=40)
+    except Exception as e:
+        try:
+            await msg.edit_text(f"❌ خطا در دریافت اطلاعات: {e}")
+        except Exception:
+            pass
+        return
+    if (inf or {}).get("entries"):
+        try:
+            await msg.edit_text("🖼 کاروسل رو پشتیبانی نمی‌کنم — لینک تک‌ریلز بفرست 🎵")
+        except Exception:
+            pass
+        return
+    token = secrets.token_hex(4)
+    FINDSONG_CACHE[token] = {"url": url, "inf": inf}
+    if len(FINDSONG_CACHE) > FINDSONG_CACHE_MAX:
+        try:
+            for k in list(FINDSONG_CACHE)[:len(FINDSONG_CACHE) - FINDSONG_CACHE_MAX]:
+                FINDSONG_CACHE.pop(k, None)
+        except Exception:
+            pass
+    job = {
+        "url": url,
+        "inf": inf,
+        "fmt": None,
+        "is_audio": False,
+        "send_to_telegram": True,
+        "ig_kind": "reel",
+        "extra_markup": InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎵 پیدا کردن آهنگ", callback_data=f"findsong:{token}"),
+        ]]),
+    }
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await finalize_job(update, ctx, job)
+
+
+async def _handle_limited_link(update, ctx, text):
+    """دسترسی محدود: فقط لینک ریلز اینستا → دانلود مستقیم بهترین کیفیت."""
+    chat_id = update.effective_chat.id
+    s0 = SESS.get(chat_id)
+    # ادامه‌ی فلوی آهنگ: اگه منتظر متن/شعر دستی هستیم، بذار همون مسیر بره
+    if s0 and s0.get("awaiting_song_query") and not URL_RE.match(text):
+        cb_prefix = s0.pop("awaiting_song_query")
+        result_key = "_ig_music_results" if cb_prefix == "igms" else "_music_results"
+        await search_song_from_lyrics_text(chat_id, ctx, text, cb_prefix=cb_prefix, result_key=result_key)
+        return
+    raw_parts = re.split(r"[\s\n\r]+", text)
+    links = []
+    seen = set()
+    for t in raw_parts:
+        t = t.strip().rstrip(".,;،؛")
+        if not t:
+            continue
+        if URL_RE.match(t) and t not in seen:
+            links.append(t)
+            seen.add(t)
+    if not links and URL_RE.match(text.strip()):
+        links = [text.strip()]
+    ig_links = [u for u in links if dl.is_instagram_url(u)]
+    if not ig_links:
+        await update.message.reply_text("🎵 فقط لینک ریلز اینستا بفرست تا دانلودش کنم.")
+        return
+    if len(ig_links) > 1:
+        await update.message.reply_text("🎵 یکی‌یکی بفرست عزیزم — اول این یکیه 👇")
+    await start_rocky_reel(update, ctx, ig_links[0])
+
+
 async def handle_link(update, ctx):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
     print(f"[link] got: {text[:80]}", flush=True)
+
+    # کاربر محدود (راکی): فقط مسیر ریلز→دانلود→آهنگ، بدون هیچ منوی دیگه
+    _uid = update.effective_user.id if update.effective_user else None
+    if _is_limited(_uid):
+        await _handle_limited_link(update, ctx, text)
+        return
 
     s0 = SESS.get(chat_id)
 
@@ -5653,15 +5748,18 @@ async def run_single_job(update, ctx, job, queue_info=None):
 
 async def button(update, ctx):
     q = update.callback_query
-    # فقط مالک — بقیه «سیکتیر»
-    if not q.from_user or q.from_user.id not in cfg.OWNER_ID:
+    chat_id = q.message.chat_id
+    data = q.data or ""
+    # فقط مالک — بقیه «سیکتیر» (استثنا: کاربر محدود فقط برای دکمه‌های مسیر آهنگ)
+    _quid = q.from_user.id if q.from_user else None
+    _cb_head = data.split(":", 1)[0]
+    _limited_ok = _is_limited(_quid) and _cb_head in LIMITED_SONG_CB
+    if (_quid is None or _quid not in cfg.OWNER_ID) and not _limited_ok:
         try:
             await q.answer("سیکتیر", show_alert=False)
         except Exception:
             pass
         return
-    chat_id = q.message.chat_id
-    data = q.data or ""
     s = SESS.get(chat_id)
 
     # فقط یک‌بار answer — دوبار زدن باعث می‌شه دکمه‌ها «کار نکنن»
@@ -5677,6 +5775,18 @@ async def button(update, ctx):
             _answered["v"] = True
 
     await _ans()
+
+    # ─── «🎵 پیدا کردن آهنگ» زیر ویدیوی کاربر محدود → همان موتور استخراج آهنگ اینستا ───
+    if data.startswith("findsong:"):
+        rec = FINDSONG_CACHE.get(data.split(":", 1)[1])
+        if not rec or not rec.get("url"):
+            try:
+                await q.answer("منقضی شده — ریلز رو دوباره بفرست", show_alert=True)
+            except Exception:
+                pass
+            return
+        await execute_ig_song_extract(update, ctx, rec["url"], rec.get("inf") or {})
+        return
 
     # ─── دکمه‌های کارت فیلم (مشابه‌ها، بازیگران، تریلر، فصل‌ها ...) → ماژول movie_bot ───
     if MOVIE_OK and data.split(":", 1)[0] in MOVIE_CB_PREFIXES:
@@ -7414,10 +7524,12 @@ def main():
             b = b.base_url(f"{_base}/bot").base_file_url(f"{_base}/file/bot")
         a = b.build()
         owner_f = filters.User(user_id=list(cfg.OWNER_ID))
+        limited_ids = list(set(getattr(cfg, "LIMITED_USERS", ()) or ()))
+        allowed_f = filters.User(user_id=list(set(list(cfg.OWNER_ID) + limited_ids))) if limited_ids else owner_f
         a.add_handler(CommandHandler("start", start_cmd))
         a.add_handler(CallbackQueryHandler(button))
         a.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & owner_f, handle_voice))
-        a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & owner_f, handle_link))
+        a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed_f, handle_link))
 
         # غیر از مالک: فقط جوابِ «سیکتیر»
         # استثنا: کسی که لینک اشتراک رو باز کرده و منتظر رمزه — باید رمزش خونده بشه
