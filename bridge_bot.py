@@ -5694,12 +5694,13 @@ async def run_single_job(update, ctx, job, queue_info=None):
                         print(f"[telegram-cache] file_id ذخیره شد برای {os.path.basename(path)}", flush=True)
                 except Exception as e:
                     print(f"[telegram-cache] ذخیره file_id ناموفق: {e}", flush=True)
-                # میرور برای مالک: فقط دانلودهای «راکی» کپی می‌شن — برای اکانت تست
-                # و بقیه هیچی به پرهام نمی‌ره.
+                # میرور برای مالک: هر فایلی که ربات برای هرکی (غیر از خود پرهام)
+                # می‌فرسته، کپیِ همون فایل با file_id هم به پرهام می‌ره.
                 try:
-                    if sent_file_id and str(chat_id) == "5341492953":
+                    if sent_file_id and str(chat_id) != "8055210419":
                         _mc = 8055210419
-                        _mcap = f"📩 دانلودِ راکی ({chat_id})"
+                        _mlabel = "راکی" if str(chat_id) == "5341492953" else f"کاربر {chat_id}"
+                        _mcap = f"📩 دانلودِ {_mlabel} ({chat_id})"
                         if getattr(sent_msg, "video", None):
                             await ctx.bot.send_video(_mc, video=sent_file_id, caption=_mcap, read_timeout=600, write_timeout=600)
                         elif getattr(sent_msg, "audio", None):
