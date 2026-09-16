@@ -3709,7 +3709,15 @@ async def start_cmd(update, ctx):
                 f"شناسه: `{payload}`",
             )
             return
-    # /start ساده (منو اصلی) — فقط مالک
+    # /start ساده (منو اصلی) — مالک: منوی کامل، کاربر محدود: راهنمای کوتاه، غریبه: سیکتیر
+    if _is_limited(update.effective_user.id if update.effective_user else None):
+        await update.message.reply_text(
+            "👋🏻 سلام!\n\n"
+            "🎵 فقط یه کار می‌کنم: لینک ریلز اینستا بفرست تا با بهترین کیفیت دانلودش کنم،\n"
+            "زیر ویدیو هم دکمه‌ی «🎵 پیدا کردن آهنگ» میاد — بزن تا آهنگشو برات پیدا کنم.\n\n"
+            "منتظر لینکت هستم 🎬"
+        )
+        return
     if not is_owner:
         await update.message.reply_text("سیکتیر")
         return
