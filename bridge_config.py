@@ -5,7 +5,7 @@
 
 import os
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848609316:AAFyL0rbBRWAz45fKUUrUMpC9nyn3cT4NR8")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848609316:AAGfGtcbVsNfhKhX1lalDy0lq2AevEWfqkg")
 
 # فقط این آیدی‌ها مجازند (می‌تونی با کاما جدا و در Variables عوض کنی، مثل: 111,222)
 _owner_env = os.environ.get("OWNER_ID", "")
