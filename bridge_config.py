@@ -5,8 +5,7 @@
 
 import os
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848609316:AAGfGtcbVsNfhKhX1lalDy0lq2AevEWfqkg")
-
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8848609316:AAFwYfe4Av3Qw_9XbNWoEDJdvqOyhGUyGOs"
 # فقط این آیدی‌ها مجازند (می‌تونی با کاما جدا و در Variables عوض کنی، مثل: 111,222)
 _owner_env = os.environ.get("OWNER_ID", "")
 if _owner_env.strip():
@@ -33,7 +32,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 PROXY_URL = os.environ.get("PROXY_URL", "")
 
 # کلیدهای سرویس‌های جانبی (اختیاری) — هرکدوم رو نداری خالی بذار، فیچر مربوطه خاموش می‌مونه
-AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "43e39b049337abee5713c970827cd90b")
+AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "f9b21e8fb14b9dbda1e213cccd8dc2e3")
 ACR_HOST = os.environ.get("ACR_HOST", "identify-eu-west-1.acrcloud.com")
 ACR_ACCESS_KEY = os.environ.get("ACR_ACCESS_KEY", "06109520263592466557ed7f8afac7fe")
 ACR_ACCESS_SECRET = os.environ.get("ACR_ACCESS_SECRET", "HNrVku2BdWJ0J96kdiJ71jyMxjr0mMCOOq5mX6ql")
