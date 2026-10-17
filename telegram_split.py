@@ -19,7 +19,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_LOCAL = os.environ.get("TELEGRAM_LOCAL_API", "0") == "1"
+_LOCAL = os.environ.get("TELEGRAM_LOCAL_API", "1") == "1"
 # سرور محلی Bot API تا ~۲ گیگ یک‌جا می‌فرسته؛ ابری فقط ۵۰ مگ.
 DEFAULT_CHUNK_BYTES = _env_int(
     "SPLIT_CHUNK_BYTES", 1900 * 1024 * 1024 if _LOCAL else 45 * 1024 * 1024)

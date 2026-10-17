@@ -43,7 +43,7 @@ YOUTUBE_DATA_API_KEY = os.environ.get("YOUTUBE_DATA_API_KEY", "AIzaSyCQpfcVpwpZg
 # محدودیت تلگرام برای ربات: ۵۰ مگ — تکه‌ها را حدود ۴۵ مگ می‌فرستیم.
 # اگه TELEGRAM_LOCAL_API=1 باشه (سرور محلی Bot API)، سقف میره تا ~۱۹۰۰ مگ و
 # فایل‌ها یک‌جا و کامل ارسال می‌شن (مثل NextSaverBot) — بدون تکه‌تکه.
-TELEGRAM_LOCAL_API = os.environ.get("TELEGRAM_LOCAL_API", "0") == "1"
+TELEGRAM_LOCAL_API = os.environ.get("TELEGRAM_LOCAL_API", "1") == "1"
 LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "http://127.0.0.1:8081").rstrip("/")
 _LOCAL_MAX = 1900 * 1024 * 1024
 TELEGRAM_MAX_BYTES = int(os.environ.get(

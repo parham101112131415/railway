@@ -10,7 +10,7 @@
 TELEGRAM_API_ID="${TELEGRAM_API_ID:-PUT_YOUR_API_ID_HERE}"
 TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-PUT_YOUR_API_HASH_HERE}"
 
-if [ "$TELEGRAM_LOCAL_API" = "1" ]; then
+if [ "${TELEGRAM_LOCAL_API:-1}" = "1" ]; then
     if [ -z "$TELEGRAM_API_ID" ] || [ -z "$TELEGRAM_API_HASH" ]; then
         echo "[start] خطا: TELEGRAM_LOCAL_API=1 ولی TELEGRAM_API_ID یا TELEGRAM_API_HASH ست نشده!" >&2
         echo "[start] از https://my.telegram.org بگیر و توی Variables ست کن." >&2
