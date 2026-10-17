@@ -112,6 +112,11 @@ URL_RE = dl.URL_RE
 import spotify_music as _music
 _music.OWNER_IDS = set(getattr(cfg, "OWNER_ID", ()) or ())
 
+# ---- per-user access control (managed in-bot via /users) ----
+import user_access as ua
+ua.OWNER_IDS = set(getattr(cfg, "OWNER_ID", ()) or ())
+ua.migrate_limited(getattr(cfg, "LIMITED_USERS", ()) or ())
+
 # کلید YouTube Data API v3 — اختیاریه (فقط برای غنی‌سازی خلاصه‌ی AI با توضیحات/فصل‌های
 # رسمی ویدیو استفاده می‌شه، نه برای گرفتن رونوشت). اگه نبود، خلاصه‌ی AI فقط از روی
 # زیرنویس/رونوشت کار می‌کنه. توی bridge_config.py اضافه کن:
@@ -3665,12 +3670,23 @@ async def start_cmd(update, ctx):
         )
         return
     if not is_owner:
-        await update.message.reply_text(
-            "👋🏻 سلام! من ربات موزیکم 🎵\n\n"
-            "🎧 لینک آهنگ بفرست (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد)\n"
-            "🔍 یا با دستور /music اسم آهنگ رو سرچ کن\n"
-            "⚙️ با /settings کیفیت پیش‌فرضت رو ست کن"
-        )
+        _suid = update.effective_user.id if update.effective_user else None
+        if ua.is_managed(_suid):
+            _mp = ua.get_perms(_suid)
+            await update.message.reply_text(
+                "👋🏻 سلام!\n\n"
+                f"دسترسی‌های تو: {ua.perms_label(_mp)}\n\n"
+                "🎧 بخش موزیک برای همه بازه:\n"
+                "• لینک آهنگ بفرست (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد)\n"
+                "• یا با /music اسم آهنگ رو سرچ کن"
+            )
+        else:
+            await update.message.reply_text(
+                "👋🏻 سلام! من ربات موزیکم 🎵\n\n"
+                "🎧 لینک آهنگ بفرست (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد)\n"
+                "🔍 یا با دستور /music اسم آهنگ رو سرچ کن\n"
+                "⚙️ با /settings کیفیت پیش‌فرضت رو ست کن"
+            )
         return
 
     text = (
@@ -3983,6 +3999,110 @@ async def start_rocky_reel(update, ctx, url):
     await finalize_job(update, ctx, job)
 
 
+# ---------------------------------------------------------------------------
+# 👥 User access management (owner only, in-bot via /users)
+# ---------------------------------------------------------------------------
+
+def _ua_kb_list():
+    users = ua.list_users()
+    kb = []
+    for uid in sorted(users):
+        info = users[uid]
+        label = f"👤 {uid} — {ua.perms_label(info.get('perms', ()))}"
+        kb.append([InlineKeyboardButton(label[:60], callback_data=f"ua:view:{uid}")])
+    kb.append([InlineKeyboardButton("➕ افزودن کاربر", callback_data="ua:add")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _ua_kb_user(uid):
+    uid = str(uid)
+    perms = set((ua.list_users().get(uid) or {}).get("perms", ()))
+    kb = []
+    row = []
+    for key, label in ua.PERMS.items():
+        mark = "✅" if key in perms else "❌"
+        row.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"ua:toggle:{uid}:{key}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([InlineKeyboardButton("🗑 حذف کاربر", callback_data=f"ua:del:{uid}")])
+    kb.append([InlineKeyboardButton("◀️ برگشت", callback_data="ua:list")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _ua_user_text(uid):
+    uid = str(uid)
+    info = ua.list_users().get(uid, {})
+    t = f"👤 کاربر `{uid}`\n"
+    if info.get("name"):
+        t += f"نام: {info['name']}\n"
+    if info.get("added"):
+        t += f"افزوده شده: {info['added']}\n"
+    t += f"\nدسترسی‌ها: {ua.perms_label(info.get('perms', ()))}\n\nبرای تغییر، روی هر دسترسی بزن:"
+    return t
+
+
+async def users_cmd(update, ctx):
+    if not ua.is_owner(update.effective_user.id if update.effective_user else None):
+        await update.message.reply_text("سیکتیر")
+        return
+    users = ua.list_users()
+    await update.message.reply_text(
+        f"👥 کاربران دارای دسترسی ({len(users)} نفر)\n\nبرای مدیریت هر کاربر روش بزن:",
+        reply_markup=_ua_kb_list())
+
+
+async def ua_callback(update, ctx):
+    q = update.callback_query
+    if not ua.is_owner(q.from_user.id if q.from_user else None):
+        try:
+            await q.answer("سیکتیر", show_alert=False)
+        except Exception:
+            pass
+        return
+    data = q.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    try:
+        if action == "list":
+            users = ua.list_users()
+            await q.edit_message_text(
+                f"👥 کاربران دارای دسترسی ({len(users)} نفر)\n\nبرای مدیریت هر کاربر روش بزن:",
+                reply_markup=_ua_kb_list())
+        elif action == "add":
+            chat_id = q.message.chat_id
+            s = SESS.get(chat_id) or {}
+            s["ua_awaiting_id"] = True
+            SESS[chat_id] = s
+            await q.edit_message_text("آیدی عددی کاربر رو بفرست:\n(مثال: `123456789`)")
+        elif action == "view" and len(parts) > 2:
+            await q.edit_message_text(_ua_user_text(parts[2]), reply_markup=_ua_kb_user(parts[2]))
+        elif action == "toggle" and len(parts) > 3:
+            ua.toggle_perm(parts[2], parts[3])
+            await q.edit_message_text(_ua_user_text(parts[2]), reply_markup=_ua_kb_user(parts[2]))
+        elif action == "del" and len(parts) > 2:
+            uid = parts[2]
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ آره، حذفش کن", callback_data=f"ua:delconfirm:{uid}")],
+                [InlineKeyboardButton("◀️ برگشت", callback_data=f"ua:view:{uid}")],
+            ])
+            await q.edit_message_text(f"🗑 کاربر `{uid}` حذف بشه؟", reply_markup=kb)
+        elif action == "delconfirm" and len(parts) > 2:
+            ua.remove_user(parts[2])
+            users = ua.list_users()
+            await q.edit_message_text(
+                f"👥 کاربران دارای دسترسی ({len(users)} نفر)\n\nبرای مدیریت هر کاربر روش بزن:",
+                reply_markup=_ua_kb_list())
+    except Exception as e:
+        print(f"[ua] {e}", flush=True)
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+
 async def _handle_limited_link(update, ctx, text):
     """دسترسی محدود: فقط لینک ریلز اینستا → دانلود مستقیم بهترین کیفیت."""
     chat_id = update.effective_chat.id
@@ -4021,11 +4141,56 @@ async def handle_link(update, ctx):
 
     # کاربر محدود (راکی): فقط مسیر ریلز→دانلود→آهنگ، بدون هیچ منوی دیگه
     _uid = update.effective_user.id if update.effective_user else None
+    _is_owner = _uid in cfg.OWNER_ID if _uid else False
     if _is_limited(_uid):
         await _handle_limited_link(update, ctx, text)
         return
 
     s0 = SESS.get(chat_id)
+
+    # افزودن کاربر جدید (از /users): مالک آیدی عددی می‌فرسته
+    if _is_owner and s0 and s0.pop("ua_awaiting_id", None):
+        _new_id = re.sub(r"\D", "", text)
+        if _new_id and len(_new_id) >= 5:
+            if ua.is_owner(_new_id):
+                await update.message.reply_text("این آیدی مال خودته 😄")
+            else:
+                ua.add_user(_new_id)
+                await update.message.reply_text(
+                    _ua_user_text(_new_id),
+                    reply_markup=_ua_kb_user(_new_id))
+        else:
+            await update.message.reply_text("آیدی عددی معتبر بفرست (مثلاً `123456789`)")
+        return
+
+    # کاربر مدیریت‌شده (نه مالک): گیت دسترسی‌ها — بقیه منطق مشترکه
+    _perms = set(ua.PERMS) if _is_owner else ua.get_perms(_uid)
+    if not _is_owner:
+        if not ua.is_managed(_uid):
+            return  # غریبه → stranger_gate جواب «سیکتیر» میده
+
+        async def _deny():
+            try:
+                await update.message.reply_text("سیکتیر")
+            except Exception:
+                pass
+
+        # منوهای مالک
+        if text in ("📜 تاریخچه", "📊 آمار", "📚 کتابخانه", "کتابخانه") or \
+           text.startswith(("🔍", "/search ", "جستجو ")):
+            await _deny()
+            return
+        if text in ("🔗 ساخت لینک", "ساخت لینک") and "share" not in _perms:
+            await _deny()
+            return
+        # فلوی‌های session
+        if s0 and s0.get("awaiting_ai_question") and "ai" not in _perms:
+            await _deny()
+            return
+        if s0 and (s0.get("awaiting_share_pw") or s0.get("awaiting_share_uses") or
+                   s0.get("awaiting_share_exp")) and "share" not in _perms:
+            await _deny()
+            return
 
     # دکمه کیبورد پایین
     if text in ("🔗 ساخت لینک", "ساخت لینک"):
@@ -4177,6 +4342,17 @@ async def handle_link(update, ctx):
             seen.add(t)
     if not links and URL_RE.match(text.strip()):
         links = [text.strip()]
+    # ---- گیت دانلود برای کاربر مدیریت‌شده ----
+    if not _is_owner and links:
+        if "dl" not in _perms:
+            if "ig" in _perms and all(dl.is_instagram_url(u) for u in links):
+                await _handle_limited_link(update, ctx, text)
+                return
+            try:
+                await update.message.reply_text("سیکتیر")
+            except Exception:
+                pass
+            return
     if not links:
         await update.message.reply_text("لینکی پیدا نشد.")
         return
@@ -5746,16 +5922,28 @@ async def button(update, ctx):
     q = update.callback_query
     chat_id = q.message.chat_id
     data = q.data or ""
-    # فقط مالک — بقیه «سیکتیر» (استثنا: کاربر محدود فقط برای دکمه‌های مسیر آهنگ)
+    # فقط مالک — بقیه «سیکتیر»
+    # (استثنا: کاربر محدود فقط برای دکمه‌های مسیر آهنگ / کاربر مدیریت‌شده بر اساس دسترسی)
     _quid = q.from_user.id if q.from_user else None
     _cb_head = data.split(":", 1)[0]
     _limited_ok = _is_limited(_quid) and _cb_head in LIMITED_SONG_CB
-    if (_quid is None or _quid not in cfg.OWNER_ID) and not _limited_ok:
-        try:
-            await q.answer("سیکتیر", show_alert=False)
-        except Exception:
-            pass
-        return
+    _is_owner_q = _quid is not None and _quid in cfg.OWNER_ID
+    if not _is_owner_q and not _limited_ok:
+        if ua.is_managed(_quid):
+            _need = ua.cb_perm(data)
+            if _need == "owner" or not ua.has_perm(_quid, _need):
+                try:
+                    await q.answer("سیکتیر", show_alert=False)
+                except Exception:
+                    pass
+                return
+            # دسترسی داره → ادامه
+        else:
+            try:
+                await q.answer("سیکتیر", show_alert=False)
+            except Exception:
+                pass
+            return
     s = SESS.get(chat_id)
 
     # فقط یک‌بار answer — دوبار زدن باعث می‌شه دکمه‌ها «کار نکنن»
@@ -7325,6 +7513,9 @@ async def finalize_job(update, ctx, job, del_msg=None):
 
 async def handle_voice(update, ctx):
     """ویس → AudD → جستجو و دانلود آهنگ."""
+    _vuid = update.effective_user.id if update.effective_user else None
+    if _vuid not in cfg.OWNER_ID and not ua.has_perm(_vuid, "voice"):
+        return  # غریبه/بدون دسترسی → stranger_gate جواب «سیکتیر» میده
     chat_id = update.effective_chat.id
     token = getattr(cfg, "AUDD_API_TOKEN", None)
     if not token:
@@ -7523,6 +7714,9 @@ def main():
         limited_ids = list(set(getattr(cfg, "LIMITED_USERS", ()) or ()))
         allowed_f = filters.User(user_id=list(set(list(cfg.OWNER_ID) + limited_ids))) if limited_ids else owner_f
         a.add_handler(CommandHandler("start", start_cmd))
+        # ---- owner user-management ----
+        a.add_handler(CommandHandler("users", users_cmd))
+        a.add_handler(CallbackQueryHandler(ua_callback, pattern=r"^ua:"))
         # ---- merged music features (public) — registered BEFORE owner-gated handlers
         a.add_handler(CommandHandler("music", _music.music_cmd))
         a.add_handler(CommandHandler("settings", _music.settings_cmd))
@@ -7533,8 +7727,8 @@ def main():
         a.add_handler(InlineQueryHandler(_music.on_inline))
         # ---- bridge handlers (owner-gated as before)
         a.add_handler(CallbackQueryHandler(button))
-        a.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & owner_f, handle_voice))
-        a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed_f, handle_link))
+        a.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+        a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
         # غیر از مالک: فقط جوابِ «سیکتیر»
         # استثنا: کسی که لینک اشتراک رو باز کرده و منتظر رمزه — باید رمزش خونده بشه
