@@ -3665,7 +3665,12 @@ async def start_cmd(update, ctx):
         )
         return
     if not is_owner:
-        await update.message.reply_text("سیکتیر")
+        await update.message.reply_text(
+            "👋🏻 سلام! من ربات موزیکم 🎵\n\n"
+            "🎧 لینک آهنگ بفرست (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد)\n"
+            "🔍 یا با دستور /music اسم آهنگ رو سرچ کن\n"
+            "⚙️ با /settings کیفیت پیش‌فرضت رو ست کن"
+        )
         return
 
     text = (
