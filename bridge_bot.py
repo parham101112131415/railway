@@ -101,10 +101,16 @@ except Exception:
 
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes,
+    CallbackQueryHandler, InlineQueryHandler, filters, ContextTypes,
 )
 
 URL_RE = dl.URL_RE
+
+# ---- merged music module (spotify-song-bot) ----
+# Public music features: Spotify/Apple/Deezer/SoundCloud links, /music search,
+# quality select, lyrics/translate/LRC, nightcore/slowed, similar songs, inline.
+import spotify_music as _music
+_music.OWNER_IDS = set(getattr(cfg, "OWNER_ID", ()) or ())
 
 # کلید YouTube Data API v3 — اختیاریه (فقط برای غنی‌سازی خلاصه‌ی AI با توضیحات/فصل‌های
 # رسمی ویدیو استفاده می‌شه، نه برای گرفتن رونوشت). اگه نبود، خلاصه‌ی AI فقط از روی
@@ -3635,6 +3641,10 @@ async def start_cmd(update, ctx):
         if payload.startswith("s_"):
             await deliver_share(update, ctx, payload)
             return
+        # دیپ‌لینک موزیک از حالت اینلاین: /start dl_<youtube_id> — برای همه بازه
+        if payload.startswith("dl_"):
+            await _music.handle_inline_deep_link(update, ctx, payload[3:])
+            return
         # payload ناشناخته
         if not is_owner:
             await update.message.reply_text("سیکتیر")
@@ -3655,7 +3665,12 @@ async def start_cmd(update, ctx):
         )
         return
     if not is_owner:
-        await update.message.reply_text("سیکتیر")
+        await update.message.reply_text(
+            "👋🏻 سلام! من ربات موزیکم 🎵\n\n"
+            "🎧 لینک آهنگ بفرست (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد)\n"
+            "🔍 یا با دستور /music اسم آهنگ رو سرچ کن\n"
+            "⚙️ با /settings کیفیت پیش‌فرضت رو ست کن"
+        )
         return
 
     text = (
@@ -7508,6 +7523,15 @@ def main():
         limited_ids = list(set(getattr(cfg, "LIMITED_USERS", ()) or ()))
         allowed_f = filters.User(user_id=list(set(list(cfg.OWNER_ID) + limited_ids))) if limited_ids else owner_f
         a.add_handler(CommandHandler("start", start_cmd))
+        # ---- merged music features (public) — registered BEFORE owner-gated handlers
+        a.add_handler(CommandHandler("music", _music.music_cmd))
+        a.add_handler(CommandHandler("settings", _music.settings_cmd))
+        a.add_handler(CommandHandler("mystats", _music.mystats_cmd))
+        a.add_handler(CommandHandler("mstats", _music.stats_cmd))
+        a.add_handler(CallbackQueryHandler(_music.on_callback, pattern=_music.MUSIC_CB_PATTERN))
+        a.add_handler(MessageHandler(_music.music_url_filter(), _music.music_link_handler))
+        a.add_handler(InlineQueryHandler(_music.on_inline))
+        # ---- bridge handlers (owner-gated as before)
         a.add_handler(CallbackQueryHandler(button))
         a.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & owner_f, handle_voice))
         a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & allowed_f, handle_link))
@@ -7599,6 +7623,7 @@ def main():
                             if me and me.username:
                                 global BOT_USERNAME
                                 BOT_USERNAME = me.username
+                                _music.BOT_USERNAME = me.username
                                 print(f"[startup] یوزرنیم ربات: @{BOT_USERNAME}", flush=True)
                         except Exception as e:
                             print(f"[startup] get_me ناموفق، از BOT_USERNAME کانفیگ استفاده می‌شه: {e}", flush=True)
@@ -7612,7 +7637,7 @@ def main():
                                 await _asyncio.sleep(5)
                         await app.updater.start_polling(
                             drop_pending_updates=True,
-                            allowed_updates=["message", "callback_query"],
+                            allowed_updates=["message", "callback_query", "inline_query"],
                             timeout=10,
                             bootstrap_retries=0,
                         )
