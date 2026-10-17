@@ -3660,15 +3660,7 @@ async def start_cmd(update, ctx):
                 f"شناسه: `{payload}`",
             )
             return
-    # /start ساده (منو اصلی) — مالک: منوی کامل، کاربر محدود: راهنمای کوتاه، غریبه: سیکتیر
-    if _is_limited(update.effective_user.id if update.effective_user else None):
-        await update.message.reply_text(
-            "👋🏻 سلام!\n\n"
-            "🎵 فقط یه کار می‌کنم: لینک ریلز اینستا بفرست تا با بهترین کیفیت دانلودش کنم،\n"
-            "زیر ویدیو هم دکمه‌ی «🎵 پیدا کردن آهنگ» میاد — بزن تا آهنگشو برات پیدا کنم.\n\n"
-            "منتظر لینکت هستم 🎬"
-        )
-        return
+    # /start ساده (منو اصلی) — مالک: منوی کامل، کاربر مدیریت‌شده: دسترسی‌هاش، غریبه: موزیک
     if not is_owner:
         _suid = update.effective_user.id if update.effective_user else None
         if ua.is_managed(_suid):
@@ -4018,15 +4010,17 @@ def _ua_kb_user(uid):
     uid = str(uid)
     perms = set((ua.list_users().get(uid) or {}).get("perms", ()))
     kb = []
-    row = []
-    for key, label in ua.PERMS.items():
-        mark = "✅" if key in perms else "❌"
-        row.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"ua:toggle:{uid}:{key}"))
-        if len(row) == 2:
+    for cat, items in ua.PERM_CATS.items():
+        kb.append([InlineKeyboardButton(f"── {cat} ──", callback_data="ua:noop")])
+        row = []
+        for key, label in items:
+            mark = "✅" if key in perms else "❌"
+            row.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"ua:toggle:{uid}:{key}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row:
             kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
     kb.append([InlineKeyboardButton("🗑 حذف کاربر", callback_data=f"ua:del:{uid}")])
     kb.append([InlineKeyboardButton("◀️ برگشت", callback_data="ua:list")])
     return InlineKeyboardMarkup(kb)
@@ -4066,7 +4060,9 @@ async def ua_callback(update, ctx):
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
     try:
-        if action == "list":
+        if action == "noop":
+            pass
+        elif action == "list":
             users = ua.list_users()
             await q.edit_message_text(
                 f"👥 کاربران دارای دسترسی ({len(users)} نفر)\n\nبرای مدیریت هر کاربر روش بزن:",
@@ -4139,12 +4135,10 @@ async def handle_link(update, ctx):
     text = update.message.text.strip()
     print(f"[link] got: {text[:80]}", flush=True)
 
-    # کاربر محدود (راکی): فقط مسیر ریلز→دانلود→آهنگ، بدون هیچ منوی دیگه
     _uid = update.effective_user.id if update.effective_user else None
     _is_owner = _uid in cfg.OWNER_ID if _uid else False
-    if _is_limited(_uid):
-        await _handle_limited_link(update, ctx, text)
-        return
+    # (legacy _is_limited flow replaced by per-user perms; migrated to dl_ig)
+    _perms = set(ua.PERMS) if _is_owner else ua.get_perms(_uid)
 
     s0 = SESS.get(chat_id)
 
@@ -4164,7 +4158,6 @@ async def handle_link(update, ctx):
         return
 
     # کاربر مدیریت‌شده (نه مالک): گیت دسترسی‌ها — بقیه منطق مشترکه
-    _perms = set(ua.PERMS) if _is_owner else ua.get_perms(_uid)
     if not _is_owner:
         if not ua.is_managed(_uid):
             return  # غریبه → stranger_gate جواب «سیکتیر» میده
@@ -4175,16 +4168,23 @@ async def handle_link(update, ctx):
             except Exception:
                 pass
 
-        # منوهای مالک
-        if text in ("📜 تاریخچه", "📊 آمار", "📚 کتابخانه", "کتابخانه") or \
-           text.startswith(("🔍", "/search ", "جستجو ")):
+        # منوها
+        if text in ("📜 تاریخچه",):
+            if "history" not in _perms:
+                await _deny()
+                return
+        elif text in ("📊 آمار",):
             await _deny()
             return
-        if text in ("🔗 ساخت لینک", "ساخت لینک") and "share" not in _perms:
+        elif text in ("📚 کتابخانه", "کتابخانه") or text.startswith(("🔍", "/search ", "جستجو ")):
+            if "library" not in _perms:
+                await _deny()
+                return
+        elif text in ("🔗 ساخت لینک", "ساخت لینک") and "share" not in _perms:
             await _deny()
             return
         # فلوی‌های session
-        if s0 and s0.get("awaiting_ai_question") and "ai" not in _perms:
+        if s0 and s0.get("awaiting_ai_question") and "ai_q" not in _perms:
             await _deny()
             return
         if s0 and (s0.get("awaiting_share_pw") or s0.get("awaiting_share_uses") or
@@ -4342,12 +4342,9 @@ async def handle_link(update, ctx):
             seen.add(t)
     if not links and URL_RE.match(text.strip()):
         links = [text.strip()]
-    # ---- گیت دانلود برای کاربر مدیریت‌شده ----
+    # ---- گیت دانلود برای کاربر مدیریت‌شده (per-site) ----
     if not _is_owner and links:
-        if "dl" not in _perms:
-            if "ig" in _perms and all(dl.is_instagram_url(u) for u in links):
-                await _handle_limited_link(update, ctx, text)
-                return
+        if any(not ua.has_perm(_uid, ua.url_perm(u)) for u in links):
             try:
                 await update.message.reply_text("سیکتیر")
             except Exception:
@@ -5925,10 +5922,8 @@ async def button(update, ctx):
     # فقط مالک — بقیه «سیکتیر»
     # (استثنا: کاربر محدود فقط برای دکمه‌های مسیر آهنگ / کاربر مدیریت‌شده بر اساس دسترسی)
     _quid = q.from_user.id if q.from_user else None
-    _cb_head = data.split(":", 1)[0]
-    _limited_ok = _is_limited(_quid) and _cb_head in LIMITED_SONG_CB
     _is_owner_q = _quid is not None and _quid in cfg.OWNER_ID
-    if not _is_owner_q and not _limited_ok:
+    if not _is_owner_q:
         if ua.is_managed(_quid):
             _need = ua.cb_perm(data)
             if _need == "owner" or not ua.has_perm(_quid, _need):
