@@ -7,8 +7,8 @@
 #   TELEGRAM_API_HASH=<از https://my.telegram.org بگیر>
 #
 # یا اگه نمی‌خوای وریبل ست کنی، مقادیر ثابتت رو جای XXX بذار:
-TELEGRAM_API_ID="${TELEGRAM_API_ID:-PUT_YOUR_API_ID_HERE}"
-TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-PUT_YOUR_API_HASH_HERE}"
+TELEGRAM_API_ID="${TELEGRAM_API_ID:-36230037}"
+TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-6f7e76233470d5a173795c7b46f2f4db}"
 
 if [ "${TELEGRAM_LOCAL_API:-1}" = "1" ]; then
     if [ -z "$TELEGRAM_API_ID" ] || [ -z "$TELEGRAM_API_HASH" ]; then
