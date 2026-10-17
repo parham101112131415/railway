@@ -50,6 +50,27 @@ DEFAULT_QUALITY = "192"
 BOT_USERNAME = ""  # set by bridge_bot at startup
 OWNER_IDS = set()  # set by bridge_bot from cfg.OWNER_ID
 
+
+def _is_owner(user_id):
+    return user_id in OWNER_IDS
+
+
+async def _gate(update):
+    """Reply سیکتیر for non-owners. Returns True if blocked."""
+    uid = update.effective_user.id if update.effective_user else None
+    if uid not in OWNER_IDS:
+        try:
+            if update.callback_query:
+                await update.callback_query.answer("سیکتیر", show_alert=False)
+            elif update.inline_query:
+                await update.inline_query.answer([], cache_time=60)
+            elif update.message:
+                await update.message.reply_text("سیکتیر")
+        except Exception:
+            pass
+        return True
+    return False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("spotibot")
 
@@ -672,6 +693,8 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _gate(update):
+        return
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("128kbps", callback_data="set:128"),
         InlineKeyboardButton("192kbps", callback_data="set:192"),
@@ -698,6 +721,8 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def mystats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _gate(update):
+        return
     uid = str(update.message.from_user.id)
     st = _load_json(STATS_FILE, {"total_downloads": 0, "users": {}})
     u = st.get("users", {}).get(uid, {"count": 0, "artists": {}})
@@ -858,6 +883,8 @@ async def handle_collection(message, kind, sid, ctx):
 
 # ---------------------------------------------------------------- callbacks -
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _gate(update):
+        return
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -1097,6 +1124,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------- inline ----
 async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _gate(update):
+        return
     iq = update.inline_query
     query = (iq.query or "").strip()
     if len(query) < 2:
@@ -1143,6 +1172,8 @@ def music_url_filter():
 
 
 async def music_link_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _gate(update):
+        return
     """Handle messages containing music links (public). Skips YouTube links."""
     text = (update.message.text or "").strip()
     urls = URL_RE.findall(text)
@@ -1160,6 +1191,8 @@ async def music_link_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def music_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _gate(update):
+        return
     """/music <query> — text search for music (public)."""
     query = " ".join(ctx.args or []).strip()
     if not query:
