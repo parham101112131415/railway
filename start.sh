@@ -5,6 +5,10 @@
 #   TELEGRAM_LOCAL_API=1
 #   TELEGRAM_API_ID=<از https://my.telegram.org بگیر>
 #   TELEGRAM_API_HASH=<از https://my.telegram.org بگیر>
+#
+# یا اگه نمی‌خوای وریبل ست کنی، مقادیر ثابتت رو جای XXX بذار:
+TELEGRAM_API_ID="${TELEGRAM_API_ID:-PUT_YOUR_API_ID_HERE}"
+TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-PUT_YOUR_API_HASH_HERE}"
 
 if [ "$TELEGRAM_LOCAL_API" = "1" ]; then
     if [ -z "$TELEGRAM_API_ID" ] || [ -z "$TELEGRAM_API_HASH" ]; then
