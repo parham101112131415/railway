@@ -3841,10 +3841,34 @@ async def deliver_share(update, ctx, share_id, password=None):
         await update.message.reply_text(f"❌ ارسال ناموفق: {e}")
 
 
+async def _setup_command_menus(app):
+    """منوی دستورات تلگرام: کاربر عادی فقط دستورات عمومی رو می‌بینه، مالک همه رو."""
+    from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    public_cmds = [
+        BotCommand("start", "شروع ربات"),
+        BotCommand("help", "راهنمای دستورات"),
+        BotCommand("music", "جستجوی آهنگ"),
+        BotCommand("settings", "تنظیم کیفیت دانلود"),
+        BotCommand("mystats", "آمار دانلودهای من"),
+    ]
+    owner_cmds = public_cmds + [
+        BotCommand("users", "مدیریت کاربران"),
+        BotCommand("mstats", "آمار کلی ربات"),
+    ]
+    try:
+        await app.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
+        for _oid in (getattr(cfg, "OWNER_ID", ()) or ()):
+            try:
+                await app.bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(chat_id=int(_oid)))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[commands] ست کردن منو ناموفق: {e}", flush=True)
+
+
 async def help_cmd(update, ctx):
     """راهنمای دستورات ربات."""
-    lines = [
-        "📖 راهنمای ربات",
+    lines = [        "📖 راهنمای ربات",
         "",
         "/start",
         "",
@@ -7956,6 +7980,7 @@ def main():
             .request(req)
             .get_updates_request(req)
             .concurrent_updates(True)
+            .post_init(_setup_command_menus)
         )
         if _local:
             _base = str(getattr(cfg, "LOCAL_API_URL", "http://127.0.0.1:8081")).rstrip("/")
