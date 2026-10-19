@@ -214,6 +214,16 @@ _SONG_BUSY = {}        # (chat_id, url) -> True : فلوی «تشخیص آهنگ
 # کش «🎵 پیدا کردن آهنگ» زیر ویدیوهای کاربر محدود: {token: {"url":..., "inf":...}}
 FINDSONG_CACHE = {}
 FINDSONG_CACHE_MAX = 500
+# کش نتایج تشخیص آهنگ (بهینه‌سازی سرعت): {canon_url: (result_tuple, timestamp)}
+# result_tuple = (query, artist, title, source, confident)
+_SONG_RESULT_CACHE = {}
+_SONG_RESULT_CACHE_TTL = 3600  # 1 ساعت
+_SONG_RESULT_CACHE_MAX = 300
+# کش صدای ازپیش‌استخراج‌شده ریلزها: {canon_url: audio_path}
+# وقتی ویدیوی ریلز دانلود میشه، صداش هم در پس‌زمینه جدا میشه تا موقع
+# زدن دکمه «پیدا کردن آهنگ» دیگه دانلودی لازم نباشه
+_REEL_AUDIO_PRELOAD = {}
+_REEL_AUDIO_PRELOAD_MAX = 50
 # کال‌بک‌هایی که کاربر محدود اجازه داره بزنه (فقط مسیر پیدا کردن آهنگ)
 LIMITED_SONG_CB = ("findsong", "igms", "lyrics")
 
@@ -2154,7 +2164,8 @@ async def _shazamapi_recognize(audio_path):
 
     این مسیر عمداً از shazamio استفاده نمی‌کند چون shazamio روی بعضی Termuxها
     به Rust/PyO3 وابسته می‌شود. ShazamAPI قدیمی‌تر است ولی wheel خالص Python دارد.
-    چند پنجره‌ی 8 ثانیه‌ای بررسی می‌شود تا Reelهای ادیت‌شده شانس بیشتری داشته باشند.
+    بهینه‌سازی سرعت: پنجره‌ها موازی اجرا می‌شن (نه پشت سر هم) + تطبیقی
+    (اول ۲ پنجره، اگه پیدا نشد بقیه + حالت‌های سرعت).
     """
     if not audio_path or not os.path.exists(audio_path):
         return None
@@ -2182,16 +2193,25 @@ async def _shazamapi_recognize(audio_path):
         duration = 0.0
 
     if duration <= 0:
-        starts = [0.0]
+        all_starts = [0.0]
     else:
-        # 8 ثانیه برای هر fingerprint؛ اول/یک‌سوم/وسط/آخر.
-        max_start = max(0.0, duration - 8.0)
-        starts = sorted(set([
+        # ۶ ثانیه برای هر fingerprint (بهینه‌سازی: کوچک‌تر = آپلود سریع‌تر)
+        max_start = max(0.0, duration - 6.0)
+        all_starts = sorted(set([
             0.0,
             max_start * 0.33,
             max_start * 0.66,
             max_start,
         ]))
+
+    # تطبیقی: فاز ۱ = اول و وسط؛ فاز ۲ = بقیه (فقط اگه فاز ۱ پیدا نکرد)
+    if len(all_starts) <= 2:
+        phase1 = all_starts
+        phase2 = []
+    else:
+        mid_idx = len(all_starts) // 2
+        phase1 = [all_starts[0], all_starts[mid_idx]]
+        phase2 = [s for s in all_starts if s not in phase1]
 
     clips = []
 
@@ -2217,121 +2237,99 @@ async def _shazamapi_recognize(audio_path):
                 return {"title": title, "artist": artist, "score": 1.0}
         return None
 
+    def _recognize_sync(clip_path):
+        # ShazamAPI has two incompatible public APIs in the wild:
+        # 0.0.2 uses Shazam(songData).recognizeSong(), while newer
+        # forks use Shazam().recognize_song(path). Support both.
+        gen = None
+        try:
+            sh = Shazam()
+            method = getattr(sh, "recognize_song", None)
+            if callable(method):
+                gen = method(clip_path)
+        except TypeError:
+            gen = None
+        except Exception:
+            gen = None
+        if gen is None:
+            with open(clip_path, "rb") as fh:
+                song_data = fh.read()
+            sh = Shazam(song_data)
+            method = getattr(sh, "recognizeSong", None)
+            if not callable(method):
+                raise RuntimeError(
+                    "نسخه ShazamAPI نه recognize_song دارد نه recognizeSong"
+                )
+            gen = method()
+        for item in gen:
+            if isinstance(item, tuple) and len(item) == 2:
+                _offset, response = item
+            else:
+                response = item
+            result = parse_response(response)
+            if result:
+                return result
+        return None
+
+    async def _try_window(start, tag, speed_ratio=None):
+        """یه پنجره رو برش بزن و تشخیص بده. برمی‌گردونه result یا None."""
+        suffix = f"{tag}" + (f"_sp{str(speed_ratio).replace('.', '_')}" if speed_ratio else "")
+        clip = f"{audio_path}.shazamapi_{suffix}.mp3"
+        clips.append(clip)
+        try:
+            if speed_ratio:
+                af = f"asetrate=16000*{speed_ratio},aresample=16000"
+                cmd = ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", audio_path,
+                       "-t", "6", "-vn", "-ac", "1",
+                       "-af", af, "-codec:a", "libmp3lame", "-b:a", "128k", clip]
+            else:
+                cmd = ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", audio_path,
+                       "-t", "6", "-vn", "-ac", "1", "-ar", "16000",
+                       "-codec:a", "libmp3lame", "-b:a", "128k", clip]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await proc.wait()
+            if not os.path.exists(clip) or os.path.getsize(clip) < 1000:
+                return None
+            result = await asyncio.to_thread(_recognize_sync, clip)
+            if result:
+                label = f"speed={speed_ratio}" if speed_ratio else f"window start={start:.1f}s"
+                print(f"[shazam-api] {label} → {result['artist']} - {result['title']}", flush=True)
+            return result
+        except Exception as e:
+            print(f"[shazam-api] {tag} خطا: {type(e).__name__}", flush=True)
+            return None
+
+    async def _run_phase(items):
+        """items: لیست (start, tag, speed_ratio). موازی اجرا کن، اولینی که پیدا شد برگردون."""
+        if not items:
+            return None
+        results = await asyncio.gather(
+            *[_try_window(s, t, r) for s, t, r in items],
+            return_exceptions=True)
+        for r in results:
+            if r and not isinstance(r, Exception):
+                return r
+        return None
+
     try:
-        for idx, start in enumerate(starts):
-            clip = f"{audio_path}.shazamapi_{idx}.mp3"
-            clips.append(clip)
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", audio_path,
-                    "-t", "8", "-vn", "-ac", "1", "-ar", "16000",
-                    "-codec:a", "libmp3lame", "-b:a", "128k", clip,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-                if not os.path.exists(clip) or os.path.getsize(clip) < 1000:
-                    continue
+        # فاز ۱: ۲ پنجره موازی
+        result = await _run_phase([(s, f"p1_{i}", None) for i, s in enumerate(phase1)])
+        if result:
+            return result
+        print("[shazam-api] فاز ۱ پیدا نکرد → فاز ۲", flush=True)
 
-                def recognize(path=clip):
-                    # ShazamAPI has two incompatible public APIs in the wild:
-                    # 0.0.2 uses Shazam(songData).recognizeSong(), while newer
-                    # forks use Shazam().recognize_song(path). Support both.
-                    gen = None
-
-                    # Newer API (documented by the archived GitHub project).
-                    try:
-                        sh = Shazam()
-                        method = getattr(sh, "recognize_song", None)
-                        if callable(method):
-                            gen = method(path)
-                    except TypeError:
-                        gen = None
-                    except Exception:
-                        gen = None
-
-                    # Old PyPI 0.0.2 API: constructor receives bytes and the
-                    # method is camelCase recognizeSong().
-                    if gen is None:
-                        with open(path, "rb") as fh:
-                            song_data = fh.read()
-                        sh = Shazam(song_data)
-                        method = getattr(sh, "recognizeSong", None)
-                        if not callable(method):
-                            raise RuntimeError(
-                                "نسخه ShazamAPI نه recognize_song دارد نه recognizeSong"
-                            )
-                        gen = method()
-
-                    for item in gen:
-                        # Both APIs yield (offset, response).
-                        if isinstance(item, tuple) and len(item) == 2:
-                            _offset, response = item
-                        else:
-                            response = item
-                        result = parse_response(response)
-                        if result:
-                            return result
-                    return None
-
-                result = await asyncio.to_thread(recognize)
-                if result:
-                    print(
-                        f"[shazam-api] window={idx} start={start:.1f}s → "
-                        f"{result['artist']} - {result['title']}",
-                        flush=True,
-                    )
-                    return result
-                print(f"[shazam-api] window={idx}: match نشد", flush=True)
-            except Exception as e:
-                print(f"[shazam-api] window={idx} خطا: {type(e).__name__}: {e}", flush=True)
-
-        # ─── سرعت عادی جواب نداد؛ ریلزهای فانک/ریمیکس/سریع‌شده معمولاً pitch و
-        # tempo‌شون یکنواخت عوض شده (نه فقط tempo)، پس فینگرپرینت با نسخهٔ
-        # اصلیِ آهنگ در دیتابیس شزام match نمی‌شه. با asetrate دو نسبت رایج
-        # ادیت اینستاگرام رو امتحان می‌کنیم: ۱.۲۵× (برعکسِ «سریع‌شده») و
-        # ۰.۸× (برعکسِ «آهسته‌شده»)، فقط روی یک پنجرهٔ میانی برای صرفه‌جویی در زمان.
-        mid_start = starts[len(starts) // 2] if starts else 0.0
-        for label, ratio in (("۱.۲۵× (اصلاح سریع‌شده)", 1.25), ("۰.۸× (اصلاح آهسته‌شده)", 0.8)):
-            clip = f"{audio_path}.shazamapi_speed_{ratio}.mp3"
-            clips.append(clip)
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-ss", f"{mid_start:.2f}", "-i", audio_path,
-                    "-t", "8", "-vn", "-ac", "1",
-                    "-af", f"asetrate=16000*{ratio},aresample=16000",
-                    "-codec:a", "libmp3lame", "-b:a", "128k", clip,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-                if not os.path.exists(clip) or os.path.getsize(clip) < 1000:
-                    continue
-
-                def recognize_speed(path=clip):
-                    with open(path, "rb") as fh:
-                        song_data = fh.read()
-                    try:
-                        sh = Shazam()
-                        method = getattr(sh, "recognize_song", None)
-                        gen = method(path) if callable(method) else None
-                    except Exception:
-                        gen = None
-                    if gen is None:
-                        sh = Shazam(song_data)
-                        gen = sh.recognizeSong()
-                    for item in gen:
-                        response = item[1] if isinstance(item, tuple) and len(item) == 2 else item
-                        result = parse_response(response)
-                        if result:
-                            return result
-                    return None
-
-                result = await asyncio.to_thread(recognize_speed)
-                if result:
-                    print(f"[shazam-api] speed={label} → {result['artist']} - {result['title']}", flush=True)
-                    return result
-                print(f"[shazam-api] speed={label}: match نشد", flush=True)
-            except Exception as e:
-                print(f"[shazam-api] speed={label} خطا: {type(e).__name__}: {e}", flush=True)
+        # فاز ۲: بقیه پنجره‌ها + حالت‌های سرعت، همه موازی
+        # ریلزهای فانک/ریمیکس/سریع‌شده معمولاً pitch و tempo‌شون یکنواخت
+        # عوض شده، پس با asetrate دو نسبت رایج رو امتحان می‌کنیم
+        mid_start = phase1[len(phase1) // 2] if phase1 else 0.0
+        phase2_items = [(s, f"p2_{i}", None) for i, s in enumerate(phase2)]
+        phase2_items.append((mid_start, "p2_sp125", 1.25))
+        phase2_items.append((mid_start, "p2_sp08", 0.8))
+        result = await _run_phase(phase2_items)
+        if result:
+            return result
     finally:
         for clip in clips:
             try:
@@ -2861,6 +2859,121 @@ def _lyrics_phrase_for_search(transcript):
     return phrase.strip() or None
 
 
+def _song_cache_get(url):
+    """برگردوندن نتیجه کش‌شده تشخیص آهنگ (اگه معتبر باشه)."""
+    try:
+        key = _canon_url(url) or url
+        rec = _SONG_RESULT_CACHE.get(key)
+        if not rec:
+            return None
+        result, ts = rec
+        if time.time() - ts > _SONG_RESULT_CACHE_TTL:
+            _SONG_RESULT_CACHE.pop(key, None)
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def _song_cache_set(url, result):
+    """ذخیره نتیجه تشخیص آهنگ در کش."""
+    try:
+        if result is None:
+            return
+        key = _canon_url(url) or url
+        if len(_SONG_RESULT_CACHE) >= _SONG_RESULT_CACHE_MAX:
+            # حذف قدیمی‌ترین‌ها
+            oldest = sorted(_SONG_RESULT_CACHE.items(), key=lambda kv: kv[1][1])[:50]
+            for k, _ in oldest:
+                _SONG_RESULT_CACHE.pop(k, None)
+        _SONG_RESULT_CACHE[key] = (result, time.time())
+    except Exception:
+        pass
+
+
+def _instagram_embed_song_name(url):
+    """مسیر سریع: اسم آهنگ رو از خود صفحه اینستا بخون (بدون دانلود صدا).
+
+    فقط وقتی جواب میده که ریلز از موزیک کتابخونه اینستا استفاده کرده باشه.
+    برای Original audio برمی‌گردونه None (باید از روی صدا تشخیص داده بشه).
+    برمی‌گردونه (query, artist, title) یا None.
+    """
+    try:
+        import urllib.request as _ur
+        if "instagram.com" not in (url or ""):
+            return None
+        embed_url = url.split("?")[0].rstrip("/") + "/embed/"
+        req = _ur.Request(embed_url, headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        })
+        raw = _ur.urlopen(req, timeout=15).read().decode("utf-8", "ignore")
+        m = re.search(
+            r'music_attribution_info\\?":\{\\?"artist_name\\?":\\?"([^"\\]+)\\?",\\?"song_name\\?":\\?"([^"\\]+)\\?",\\?"uses_original_audio\\?":(true|false)',
+            raw)
+        if not m:
+            return None
+        artist, song, original = m.group(1), m.group(2), m.group(3)
+        if original == "true" or song.lower() in ("original audio", ""):
+            return None
+        artist, song = artist.strip(), song.strip()
+        if not song:
+            return None
+        query = f"{artist} {song}".strip() if artist else song
+        print(f"[song-id] اینستا مستقیم داد: {query}", flush=True)
+        return query, artist or None, song
+    except Exception as e:
+        print(f"[song-id] embed اینستا ناموفق: {type(e).__name__}", flush=True)
+        return None
+
+
+def _reel_audio_preload_get(url):
+    """اگه صدای ریلز از قبل استخراج شده، مسیرش رو بده."""
+    try:
+        key = _canon_url(url) or url
+        path = _REEL_AUDIO_PRELOAD.get(key)
+        if path and os.path.exists(path):
+            return path
+        _REEL_AUDIO_PRELOAD.pop(key, None)
+    except Exception:
+        pass
+    return None
+
+
+async def _reel_audio_preload(url, video_path):
+    """پس‌زمینه: صدای ویدیوی ریلز رو جدا کن و کش کن.
+
+    وقتی کاربر لینک ریلز میده و ویدیو دانلود میشه، این تابع در پس‌زمینه
+    صدا رو استخراج می‌کنه تا موقع زدن «پیدا کردن آهنگ» آماده باشه.
+    کاملاً best-effort هست — خطا نباید فلوی اصلی رو بشکنه.
+    """
+    try:
+        if not video_path or not os.path.exists(video_path):
+            return
+        if not dl.is_instagram_url(url):
+            return
+        key = _canon_url(url) or url
+        if key in _REEL_AUDIO_PRELOAD:
+            return
+        # استخراج صدا (۶۰ ثانیه اول کافیه برای تشخیص)
+        out = f"{video_path}.preload.mp3"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", video_path, "-t", "60",
+            "-vn", "-ac", "1", "-ar", "16000",
+            "-codec:a", "libmp3lame", "-b:a", "96k", out,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
+        if os.path.exists(out) and os.path.getsize(out) > 1000:
+            if len(_REEL_AUDIO_PRELOAD) >= _REEL_AUDIO_PRELOAD_MAX:
+                # حذف قدیمی‌ترین
+                _REEL_AUDIO_PRELOAD.pop(next(iter(_REEL_AUDIO_PRELOAD)), None)
+            _REEL_AUDIO_PRELOAD[key] = out
+            print(f"[song-id] صدای ریلز پیش‌استخراج شد: {key[:50]}", flush=True)
+        elif os.path.exists(out):
+            os.remove(out)
+    except Exception as e:
+        print(f"[song-id] پیش‌استخراج صدا ناموفق: {type(e).__name__}", flush=True)
+
+
 async def identify_song_from_url(url, on_status=None):
     """
     صدای ویدیو رو فقط یک‌بار دانلود می‌کنه (نه دوبار مثل قبل) و به ترتیب امتحان
@@ -2877,79 +2990,170 @@ async def identify_song_from_url(url, on_status=None):
         return None, None, None, None, False
     print(f"[song-id] شروع تشخیص برای: {url}", flush=True)
 
+    # بهینه‌سازی ۱: کش نتایج — اگه این لینک قبلاً تشخیص داده شده، فوری برگردون
+    cached = _song_cache_get(url)
+    if cached:
+        print(f"[song-id] از کش اومد: {cached[0]}", flush=True)
+        return cached
+
+    # بهینه‌سازی ۲: مسیر سریع اینستا — اسم آهنگ از خود صفحه (بدون دانلود صدا)
+    # فقط برای ریلزهایی که از موزیک کتابخونه اینستا استفاده کردن جواب میده
     try:
-        t0 = time.time() - 2
-        raw_path = await asyncio.to_thread(dl.download, url, None, True, None, None)
+        emb = await asyncio.to_thread(_instagram_embed_song_name, url)
+    except Exception:
+        emb = None
+    if emb:
+        query, artist, title = emb
+        result = (query, artist, title, "instagram", True)
+        _song_cache_set(url, result)
+        return result
+
+    try:
+        # بهینه‌سازی ۶: اول چک کن صدا از قبل پیش‌استخراج شده یا نه
+        audio_path = _reel_audio_preload_get(url)
+        if audio_path:
+            print(f"[song-id] صدا از پیش‌استخراج آماده بود (بدون دانلود)", flush=True)
+            t0 = time.time() - 2
+            raw_path = audio_path
+        else:
+            t0 = time.time() - 2
+            raw_path = await asyncio.to_thread(dl.download, url, None, True, None, None)
     except Exception as e:
         print(f"[song-id] دانلود صدا ناموفق: {e}", flush=True)
         return None, None, None, None, False
-    audio_path = _resolve_actual_audio_path(raw_path, since_ts=t0)
+    if not audio_path:
+        audio_path = _resolve_actual_audio_path(raw_path, since_ts=t0)
     if not audio_path:
         print(f"[song-id] دانلود صدا برای تشخیص چیزی نداد (raw_path={raw_path!r})", flush=True)
         return None, None, None, None
     print(f"[song-id] صدا دانلود شد: {audio_path}", flush=True)
 
     try:
-        # مرحله ۱: اثرانگشت صدا (AudD) — فقط همین، مثل قبل که درست کار می‌کرد
+        # بهینه‌سازی ۳+۴: هر سه موتور تشخیص (AudD / Shazam / ACRCloud) رو
+        # موازی اجرا می‌کنیم به‌جای پشت سر هم، هر کدوم با تایم‌اوت تهاجمی.
+        # اولویت نتیجه: AudD مطمئن > Shazam > ACRCloud (مثل منطق قبلی).
         token = getattr(cfg, "AUDD_API_TOKEN", None)
-        if token:
-            result = await _audd_recognize(audio_path, token)
-            if result:
-                title = (result.get("title") or "").strip()
-                artist = (result.get("artist") or "").strip()
-                audd_score = result.get("score", 0.0)
-                if title:
-                    query = f"{artist} {title}".strip() if artist else title
-                    low = (title + " " + artist).lower()
-                    if any(w in low for w in ("remix", "mix", "edit", "bootleg", "funk", "sped up", "slowed")):
-                        query = f"{query} official audio"
-                    # score پایین فقط یک candidate تشخیصی است؛ هرگز به کاربر
-                    # به‌عنوان آهنگ پیدا‌شده تحویل نمی‌دهیم. مخصوصاً score=0.
-                    confident = audd_score >= 0.7
-                    print(f"[song-id] AudD confident={confident} (score={audd_score:.2f})", flush=True)
-                    if confident:
-                        return query, artist, title, "audd", True
-                    print("[song-id] AudD ضعیف بود → ادامه با رونویسی متن", flush=True)
-        else:
-            print("[song-id] AUDD_API_TOKEN ست نشده، رد شد", flush=True)
 
-        # مرحله ۱.۵: شزام (فالبک رایگان، دیتابیس فارسی کامل‌تر از AudD).
-        # فقط وقتی AudD قطعی نداد (score پایین / توکن نبود / نتیجهٔ متناقض)
-        # اجرا میشه — و چون خروجی‌اش نام/خوانندهٔ تمیزه، آهنگ رو مستقیم و
-        # درست دانلود می‌کنه (برخلاف STT فارسی که خروجی کثیف میده).
-        shazam_res = await _shazamapi_recognize(audio_path)
+        async def _audd_wrapped():
+            if not token:
+                print("[song-id] AUDD_API_TOKEN ست نشده، رد شد", flush=True)
+                return None
+            try:
+                return await asyncio.wait_for(
+                    _audd_recognize(audio_path, token), timeout=25)
+            except asyncio.TimeoutError:
+                print("[song-id] AudD تایم‌اوت شد", flush=True)
+                return None
+            except Exception as e:
+                print(f"[song-id] AudD خطا: {type(e).__name__}", flush=True)
+                return None
+
+        async def _shazam_wrapped():
+            try:
+                return await asyncio.wait_for(
+                    _shazamapi_recognize(audio_path), timeout=30)
+            except asyncio.TimeoutError:
+                print("[song-id] Shazam تایم‌اوت شد", flush=True)
+                return None
+            except Exception as e:
+                print(f"[song-id] Shazam خطا: {type(e).__name__}", flush=True)
+                return None
+
+        async def _acr_wrapped():
+            try:
+                return await asyncio.wait_for(
+                    _acr_recognize(audio_path), timeout=30)
+            except asyncio.TimeoutError:
+                print("[song-id] ACRCloud تایم‌اوت شد", flush=True)
+                return None
+            except Exception as e:
+                print(f"[song-id] ACRCloud خطا: {type(e).__name__}", flush=True)
+                return None
+
+        audd_res, shazam_res, acr_res = await asyncio.gather(
+            _audd_wrapped(), _shazam_wrapped(), _acr_wrapped(),
+            return_exceptions=True)
+        # gather با return_exceptions=True هیچ‌وقت raise نمی‌کنه، ولی برای
+        # اطمینان هر نتیجه‌ی Exception رو None می‌کنیم
+        if isinstance(audd_res, Exception):
+            audd_res = None
+        if isinstance(shazam_res, Exception):
+            shazam_res = None
+        if isinstance(acr_res, Exception):
+            acr_res = None
+
+        # اولویت ۱: AudD با اطمینان بالا
+        if audd_res:
+            title = (audd_res.get("title") or "").strip()
+            artist = (audd_res.get("artist") or "").strip()
+            audd_score = audd_res.get("score", 0.0)
+            if title:
+                query = f"{artist} {title}".strip() if artist else title
+                low = (title + " " + artist).lower()
+                if any(w in low for w in ("remix", "mix", "edit", "bootleg", "funk", "sped up", "slowed")):
+                    query = f"{query} official audio"
+                confident = audd_score >= 0.7
+                print(f"[song-id] AudD confident={confident} (score={audd_score:.2f})", flush=True)
+                if confident:
+                    result = (query, artist, title, "audd", True)
+                    _song_cache_set(url, result)
+                    return result
+                print("[song-id] AudD ضعیف بود → ادامه با بقیه", flush=True)
+
+        # اولویت ۲: شزام
+        # (فالبک رایگان، دیتابیس فارسی کامل‌تر از AudD)
         if shazam_res:
             title = (shazam_res.get("title") or "").strip()
             artist = (shazam_res.get("artist") or "").strip()
             if title:
                 query = f"{artist} {title}".strip() if artist else title
                 print(f"[song-id] Shazam confident → {artist} - {title}", flush=True)
-                return query, artist, title, "shazam", True
+                result = (query, artist, title, "shazam", True)
+                _song_cache_set(url, result)
+                return result
 
-        # مرحله ۱.۷: ACRCloud (سومین دیتابیس فینگرپرینت مستقل — رایگان تا سقف
-        # ماهانه‌ی پلن Free — پوشش خیلی خوبی برای ریمیکس/بی‌کلام/موسیقی منطقه‌ای
-        # داره). تابعش از قبل کامل نوشته شده بود ولی وصل نشده بود.
-        acr_res = await _acr_recognize(audio_path)
+        # اولویت ۳: ACRCloud
         if acr_res:
             title = (acr_res.get("title") or "").strip()
             artist = (acr_res.get("artist") or "").strip()
             if title:
                 query = f"{artist} {title}".strip() if artist else title
                 print(f"[song-id] ACRCloud confident → {artist} - {title}", flush=True)
-                return query, artist, title, "acrcloud", True
+                result = (query, artist, title, "acrcloud", True)
+                _song_cache_set(url, result)
+                return result
 
         # مرحله ۲: رونویسی متن/شعر (STT) و جستجو از روی اون.
         # چون STT (مخصوصاً فارسی) ممکنه خروجی کثیف بده، اینجا هرگز quiet
         # auto_pick=True نمی‌کنیم — confident=False برمی‌گردونیم تا لایه‌ی
         # بالادست (search_and_send_music_options) به‌جای دانلود کورکورانه،
         # لیست کاندیدا نشون بده و خود کاربر آهنگ درست رو تایید/انتخاب کنه.
+        # بهینه‌سازی: برای صداهای خیلی کوتاه (<۲۰ ثانیه) STT رو رد می‌کنیم
+        # چون کنده و به‌ندرت برای موزیک جواب میده.
         print("[song-id] AudD و Shazam و ACRCloud هر سه fail شدند → رونویسی متن/شعر", flush=True)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            _dur = float((out or b"0").decode(errors="ignore").strip() or 0)
+        except Exception:
+            _dur = 0.0
+        if _dur > 0 and _dur < 20:
+            print(f"[song-id] صدا کوتاهه ({_dur:.0f}s) → STT رد شد", flush=True)
+            return None, None, None, None, False
         if on_status:
             try:
                 await on_status("📝 صدا رو نشناختم؛ دارم از روی شعر/متنش جستجو می‌کنم...")
             except Exception:
                 pass
-        transcript = await _transcribe_audio_for_lyrics(audio_path)
+        try:
+            transcript = await asyncio.wait_for(
+                _transcribe_audio_for_lyrics(audio_path), timeout=90)
+        except asyncio.TimeoutError:
+            print("[song-id] STT تایم‌اوت شد", flush=True)
+            return None, None, None, None, False
         phrase = _lyrics_phrase_for_search(transcript)
         if phrase:
             print(f"[song-id] عبارت جستجو از روی رونویسی: {phrase[:120]}", flush=True)
@@ -5510,6 +5714,14 @@ async def run_single_job(update, ctx, job, queue_info=None):
                     print(f"[done] fallback to newest file: {path}", flush=True)
         # کاور + اطلاعات ویدیو همیشه فرستاده می‌شه
         th = dl.fetch_thumbnail(job.get("inf") or {})
+        # بهینه‌سازی ۶: پیش‌استخراج صدا برای ریلز اینستا (پس‌زمینه)
+        # تا موقع زدن «پیدا کردن آهنگ» صدا آماده باشه و دانلود لازم نباشه
+        try:
+            _rurl = job.get("url") or url
+            if _rurl and dl.is_instagram_url(_rurl) and path and os.path.exists(path):
+                asyncio.create_task(_reel_audio_preload(_rurl, path))
+        except Exception:
+            pass
         if th:
             try:
                 cap = build_meta_text(job.get("inf") or {}, with_desc=False)
