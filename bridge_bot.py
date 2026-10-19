@@ -3841,6 +3841,72 @@ async def deliver_share(update, ctx, share_id, password=None):
         await update.message.reply_text(f"❌ ارسال ناموفق: {e}")
 
 
+async def help_cmd(update, ctx):
+    """راهنمای دستورات ربات."""
+    is_owner = update.effective_user and update.effective_user.id in cfg.OWNER_ID
+    lines = [
+        "📖 راهنمای ربات",
+        "",
+        "/start",
+        "",
+        "کاربرد: شروع ربات و دیدن منو",
+        "",
+        "طرز استفاده: /start",
+        "",
+        "━━━━━━━━━━━━━━━",
+        "",
+        "/music",
+        "",
+        "کاربرد: جستجوی آهنگ با متن",
+        "",
+        "طرز استفاده: /music مجنون تو - مرضیه",
+        "",
+        "━━━━━━━━━━━━━━━",
+        "",
+        "/settings",
+        "",
+        "کاربرد: تنظیم کیفیت پیش‌فرض دانلود آهنگ",
+        "",
+        "طرز استفاده: /settings",
+        "",
+        "━━━━━━━━━━━━━━━",
+        "",
+        "/mystats",
+        "",
+        "کاربرد: دیدن آمار دانلودهای خودت",
+        "",
+        "طرز استفاده: /mystats",
+        "",
+        "━━━━━━━━━━━━━━━",
+        "",
+        "🎵 بدون دستور هم می‌تونی:",
+        "• لینک آهنگ بفرستی (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد، یوتیوب)",
+        "• لینک ریلز اینستا بفرستی و با دکمه «🎵 پیدا کردن آهنگ» اسم آهنگش رو پیدا کنی",
+    ]
+    if is_owner:
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━",
+            "",
+            "👑 دستورات مدیر:",
+            "",
+            "/users",
+            "",
+            "کاربرد: مدیریت کاربران و دسترسی‌ها",
+            "",
+            "طرز استفاده: /users",
+            "",
+            "━━━━━━━━━━━━━━━",
+            "",
+            "/mstats",
+            "",
+            "کاربرد: دیدن آمار کلی ربات",
+            "",
+            "طرز استفاده: /mstats",
+        ]
+    await update.message.reply_text("\n".join(lines))
+
+
 async def start_cmd(update, ctx):
     args = ctx.args or []
     is_owner = update.effective_user and update.effective_user.id in cfg.OWNER_ID
@@ -7921,6 +7987,7 @@ def main():
         limited_ids = list(set(getattr(cfg, "LIMITED_USERS", ()) or ()))
         allowed_f = filters.User(user_id=list(set(list(cfg.OWNER_ID) + limited_ids))) if limited_ids else owner_f
         a.add_handler(CommandHandler("start", start_cmd))
+        a.add_handler(CommandHandler("help", help_cmd))
         # ---- owner user-management ----
         a.add_handler(CommandHandler("users", users_cmd))
         a.add_handler(CallbackQueryHandler(ua_callback, pattern=r"^ua:"))
