@@ -3843,7 +3843,6 @@ async def deliver_share(update, ctx, share_id, password=None):
 
 async def help_cmd(update, ctx):
     """راهنمای دستورات ربات."""
-    is_owner = update.effective_user and update.effective_user.id in cfg.OWNER_ID
     lines = [
         "📖 راهنمای ربات",
         "",
@@ -3883,27 +3882,6 @@ async def help_cmd(update, ctx):
         "• لینک آهنگ بفرستی (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد، یوتیوب)",
         "• لینک ریلز اینستا بفرستی و با دکمه «🎵 پیدا کردن آهنگ» اسم آهنگش رو پیدا کنی",
     ]
-    if is_owner:
-        lines += [
-            "",
-            "━━━━━━━━━━━━━━━",
-            "",
-            "👑 دستورات مدیر:",
-            "",
-            "/users",
-            "",
-            "کاربرد: مدیریت کاربران و دسترسی‌ها",
-            "",
-            "طرز استفاده: /users",
-            "",
-            "━━━━━━━━━━━━━━━",
-            "",
-            "/mstats",
-            "",
-            "کاربرد: دیدن آمار کلی ربات",
-            "",
-            "طرز استفاده: /mstats",
-        ]
     await update.message.reply_text("\n".join(lines))
 
 
