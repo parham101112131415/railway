@@ -356,7 +356,7 @@ def _ir_extract(body, key):
     return None
 
 
-async def _fetch_ir_site_lyrics(artist, title):
+async def _fetch_ir_site_lyrics(artist, title, query=None, keys_override=None):
     """جایگزین MusicXMatch: متن کامل آهنگ از سایت‌های موزیک ایرانی (رایگان، بدون کلید).
 
     خیلی از آهنگ‌های فارسی توی جستجوی خود سایت‌ها نیستن ولی صفحه‌شون توی DDG ایندکس
@@ -375,7 +375,9 @@ async def _fetch_ir_site_lyrics(artist, title):
         keys = [" ".join(words[:2])]
     else:
         keys = [title.strip()]
-    q = f"{title.strip()} {artist or ''} متن آهنگ".strip()
+    if keys_override:
+        keys = list(keys_override)
+    q = query or f"{title.strip()} {artist or ''} متن آهنگ".strip()
     return await asyncio.to_thread(_ir_site_sync, q, keys)
 
 
@@ -410,9 +412,9 @@ def _ir_site_sync(q, keys):
         # فالبک: جستجوی خود سایت‌ها (آهنگ‌هایی که توی ایندکس داخلیشون هست)
         try:
             for dom in _IR_LYRICS_SITES:
-                u = f"https://{dom}/?s={_up.quote(key)}"
+                u = f"https://{dom}/?s={_up.quote(keys[0])}"
                 r2 = s.get(u, timeout=8)
-                if r2.status_code == 200 and key in r2.text:
+                if r2.status_code == 200 and keys[0] in r2.text:
                     candidates.append(u)
                     break
         except Exception:
@@ -442,6 +444,111 @@ def _ir_site_sync(q, keys):
             if out:
                 return out
     return None
+
+
+def _genius_extract(page_html):
+    """متن آهنگ رو از کانتینرهای متنِ صفحه‌ی genius.com جدا می‌کنه."""
+    import html as _html
+    blocks = re.findall(r'data-lyrics-container="true"[^>]*>(.*?)</div>', page_html, re.S)
+    if not blocks:
+        return None
+    out = []
+    for b in blocks:
+        b = re.sub(r"<br\s*/?>", "\n", b)
+        b = re.sub(r"<[^>]+>", "", b)
+        out.append(_html.unescape(b).strip())
+    text = "\n".join(x for x in out if x).strip()
+    lines = text.splitlines()
+    while lines and ("Contributor" in lines[0] or lines[0].strip().endswith("Lyrics") or not lines[0].strip()):
+        lines.pop(0)
+    text = "\n".join(lines).strip()
+    return text or None
+
+
+def _genius_sync(queries, must_contain=None):
+    """اول با API جستجوی خود genius.com صفحه‌ی آهنگ رو پیدا می‌کنه (دقیق و بدون کلید)؛
+    اگه جواب نداد، فالبک DDG. متن از کانتینرهای متنِ صفحه جدا می‌شه (تو thread)."""
+    try:
+        import curl_cffi.requests as _cr
+        s = _cr.Session(impersonate="chrome")
+        s.headers.update({"User-Agent": _IR_UA, "Referer": "https://duckduckgo.com/",
+                          "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8"})
+    except Exception as e:
+        print(f"[lyrics] genius curl_cffi: {e}", flush=True)
+        return None
+    import urllib.parse as _up
+
+    def _try_page(u):
+        try:
+            rp = s.get(u, timeout=15)
+        except Exception as e:
+            print(f"[lyrics] genius page {u[:60]}: {e}", flush=True)
+            return None
+        if rp.status_code != 200:
+            print(f"[lyrics] genius page status {rp.status_code}: {u[:60]}", flush=True)
+            return None
+        out = _genius_extract(rp.text)
+        if out and len(out) >= 80 and (not must_contain or must_contain in out):
+            return out
+        return None
+
+    # مسیر اصلی: API جستجوی Genius — زیر فشارِ پشت‌سرهم گاهی خالی برمی‌گرده،
+    # پس یه دور کامل رو بعد از ۲ ثانیه دوباره امتحان می‌کنیم.
+    import time as _time
+    for _attempt in range(2):
+        if _attempt:
+            _time.sleep(2)
+        for q in queries[:4]:
+            try:
+                resp = s.get("https://genius.com/api/search/multi?per_page=5&q=" + _up.quote(q), timeout=15)
+                if resp.status_code != 200:
+                    continue
+                sections = (resp.json().get("response") or {}).get("sections") or []
+            except Exception as e:
+                print(f"[lyrics] genius api: {e}", flush=True)
+                continue
+            for sec in sections:
+                if sec.get("type") != "song":
+                    continue
+                for hit in (sec.get("hits") or [])[:3]:
+                    u = ((hit or {}).get("result") or {}).get("url")
+                    if u:
+                        out = _try_page(u)
+                        if out:
+                            return out
+    # فالبک: DDG با site:genius.com
+    for q in queries:
+        try:
+            resp = s.get("https://html.duckduckgo.com/html/?q=" + _up.quote(f"site:genius.com {q}"), timeout=12)
+        except Exception as e:
+            print(f"[lyrics] genius ddg: {e}", flush=True)
+            continue
+        urls = []
+        for href in re.findall(r'class="result__a"[^>]*href="([^"]+)"', resp.text):
+            mu = re.search(r"uddg=([^&]+)", href)
+            u = _up.unquote(mu.group(1)) if mu else href
+            if "genius.com/" in u and "/artists/" not in u and "lyrics" in u.lower() and u not in urls:
+                urls.append(u)
+        for u in urls[:2]:
+            out = _try_page(u)
+            if out:
+                return out
+    return None
+
+
+async def _fetch_genius_lyrics(artist, title, extra_queries=None, must_contain=None):
+    queries = []
+    for q in (extra_queries or []):
+        if q and q not in queries:
+            queries.append(q)
+    base = f"{artist or ''} {title or ''}".strip()
+    if base and base not in queries:
+        queries.append(base)
+    if title and title not in queries:
+        queries.append(title)
+    if not queries:
+        return None
+    return await asyncio.to_thread(_genius_sync, queries, must_contain)
 
 
 async def fetch_lyrics(artist, title, raw_title=None):
@@ -541,6 +648,50 @@ async def fetch_lyrics(artist, title, raw_title=None):
             hit = await _fetch_ir_site_lyrics(a, t)
             if hit:
                 return hit
+
+    # 3b) عنوانِ آلوده به برچسب («اجرای ترانه سوگند» از تشخیص ACR) و سرنخِ مصرع اول
+    # که توی عنوان خام یوتیوب توی پرانتز میاد («...(هرگز به تیغشان نمیرد...)»).
+    # با خودِ مصرع اول جستجو می‌کنیم تا آهنگِ هم‌نامِ اشتباه نیاد (مثلاً «سوگند» ویگن).
+    _hint = ""
+    _hint_key = ""
+    _core = ""
+    if raw_title:
+        _paren = re.search(r"[（(]([^）)]*[؀-ۿ][^）)]*)[）)]", str(raw_title))
+        if _paren:
+            _hint = " ".join(re.findall(r"[؀-ۿ]+", _paren.group(1)))
+            _hint = re.sub(r"\s+", " ", _hint).strip()
+        _core = re.sub(r"[（(][^）)]*[）)]", " ", title)
+        _core = re.sub(r"^\s*(اجرای|اجرا|اجراي)\s+", " ", _core)
+        _core = re.sub(r"(?:^|\s)(ترانه|آهنگ)(?=\s|$)", " ", _core)
+        _core = re.sub(r"\s+", " ", _core).strip(" -–—|")
+        _hint_key = " ".join(_hint.split()[:3]) if _hint else ""
+        if _hint_key:
+            for _q_try, _t_try in (
+                (f"{_core} {_hint} متن آهنگ".strip(), _core or _hint),
+                (f"{_hint} متن آهنگ", _hint),
+            ):
+                _hit = await _fetch_ir_site_lyrics("", _t_try, query=_q_try, keys_override=[_hint_key])
+                if _hit and _hint_key in _hit:
+                    print(f"[lyrics] ir-site hint match: {_hint_key}", flush=True)
+                    return _hit
+        elif _core and _core != title:
+            _hit = await _fetch_ir_site_lyrics("", _core)
+            if _hit:
+                return _hit
+
+    # 3c) Genius — مخصوصاً وقتی متادیتا از ACR اومده و سایت‌های ایرانی یا ندارن
+    # یا از این IP بلاکن (lyricstranslate 403 می‌داد). اگه سرنخِ مصرع اول هست،
+    # متنِ برگشتی حتماً باید شاملش باشه تا آهنگ هم‌نامِ اشتباه ارسال نشه.
+    _g_extra = []
+    if _core:
+        _g_extra += [f"{artist} {_core}".strip(), _core]
+    if _hint:
+        _g_extra.append(_hint)
+    _g = await _fetch_genius_lyrics(artist, title, extra_queries=_g_extra or None,
+                                     must_contain=_hint_key or None)
+    if _g and (not _hint_key or _hint_key in _g):
+        print(f"[lyrics] genius match for: {artist} - {title}", flush=True)
+        return _g
 
     # 2c) بعضی کانالها وسط عنوان یه برچسب لاتین میذارن («Soghati | هایده - سوغاتی»).
     # وقتی عنوان فارسی / آرتیست فارسی جواب نداد، اون بخش لاتین رو هم به‌عنوان track امتحان کن —
