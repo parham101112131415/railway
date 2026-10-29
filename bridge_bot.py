@@ -3741,14 +3741,17 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
                     result = await run_single_job(update, ctx, job, quiet_fail=True)
                     if not result and result != "__cancelled__":
                         # آپلود اول دانلود نشد — آپلودهای جایگزین رو امتحان کن
-                        for cand in candidates[1:]:
+                        for ci, cand in enumerate(candidates[1:], start=2):
                             cand_url = cand.get("url") or cand.get("webpage_url") or cand.get("id")
                             if cand_url and "http" not in str(cand_url):
                                 cand_url = f"https://www.youtube.com/watch?v={cand_url}"
                             if not cand_url:
                                 continue
                             print(f"[music] آپلود جایگزین: {cand.get('title')!r}", flush=True)
-                            await msg.edit_text(f"🎵 {t}\n⬇️ در حال دانلود (تلاش جایگزین)...")
+                            try:
+                                await msg.edit_text(f"🎵 {cand.get('title') or t}\n⬇️ در حال دانلود (تلاش {ci} از {len(candidates)})...")
+                            except Exception:
+                                pass
                             job2 = dict(job)
                             job2["url"] = cand_url
                             job2["inf"] = cand
