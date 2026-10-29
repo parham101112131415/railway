@@ -4800,7 +4800,15 @@ async def handle_link(update, ctx):
                 pass
             return
     if not links:
-        await update.message.reply_text("لینکی پیدا نشد.")
+        # متنِ ساده = جستجوی آهنگ با اسم (مثل ربات دوم): به‌جای «لینکی پیدا نشد»،
+        # با همون عبارت توی یوتیوب می‌گردیم و لیست انتخاب می‌دیم.
+        q_text = text.strip()
+        if len(q_text) >= 2:
+            await search_and_send_music_options(
+                chat_id, ctx, q_text, cb_prefix="ms",
+                result_key="_music_results", update=update, auto_pick=False)
+        else:
+            await update.message.reply_text("لینکی پیدا نشد.")
         return
     if len(links) > 1:
         SESS[chat_id] = {
