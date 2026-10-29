@@ -2645,14 +2645,19 @@ async def _audd_recognize(audio_path, token):
                 data = {}
             result = (data or {}).get("result")
             if isinstance(result, dict) and (result.get("title") or "").strip():
-                # AudD یک فیلد score می‌ده (۰ تا ۱) که نشون‌دهنده‌ی اطمینان
-                # تشخیصه. برای آهنگای فانک/بی‌کلام/ادیت‌شده که fingerprint
-                # ضعیفی دارن اغلب زیر ۰.۷ میاد و نشونه‌ی کاذب‌مثبت بودنه.
+                # تصحیح تجربی (۲۰۲۶-۱۰-۲۹): AudD در پاسخ تشخیص اصلاً فیلد score
+                # نمی‌فرسته — یا match می‌ده یا result خالی. قبلاً نبودِ score
+                # به‌صورت ۰٫۰ خونده می‌شد و گیت ۰٫۷ پایین‌دست همه‌ی matchهای
+                # AudD رو دور می‌ریخت. حالا نبودِ score یعنی «match قطعی خودِ
+                # سرویس» و ۱٫۰ حساب می‌شه؛ اگه روزی score واقعی بفرسته، همون
+                # مقدار خودش ملاک گیت‌های پایین‌دست می‌مونه.
+                _raw_score = result.get("score")
                 try:
-                    result["score"] = float(result.get("score") or 0.0)
+                    result["score"] = float(_raw_score) if _raw_score is not None else 1.0
                 except Exception:
-                    result["score"] = 0.0
-                print(f"[audd] window ss={start:.1f}s → {result.get('artist')} - {result.get('title')} (score={result['score']:.2f})", flush=True)
+                    result["score"] = 1.0
+                _sc_disp = f"{result['score']:.2f}" if _raw_score is not None else "n/a"
+                print(f"[audd] window ss={start:.1f}s → {result.get('artist')} - {result.get('title')} (score={_sc_disp})", flush=True)
                 return result
             if isinstance(data, dict) and data.get("error"):
                 print(f"[audd] window ss={start:.1f}s error: {data.get('error')}", flush=True)
