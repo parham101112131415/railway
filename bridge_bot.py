@@ -275,7 +275,8 @@ async def _fetch_lrclib(params):
 
 _IR_LYRICS_SITES = ("systemmusic.ir", "melonmusic.ir", "krakenmusic.ir", "opxmusic.ir", "imimusic.ir",
                     "songsara.net", "musicdel.ir", "irtext.ir", "lachini.com", "lyricstranslate.com",
-                    "tarafdari.com")
+                    "tarafdari.com", "rozmusic.com", "ahaang.com", "irjavan.com", "playmusic.ir",
+                    "navahang.com")
 _IR_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
           "Chrome/126.0.0.0 Safari/537.36")
 
@@ -356,6 +357,45 @@ def _ir_extract(body, key):
     return None
 
 
+def _ir_extract_longest(body, must_have=()):
+    """فالبک استخراج: وقتی کلیدِ مصرعی جواب نداد، بلاکِ بعد از تیتر «متن آهنگ» رو
+    برمی‌گردونه — به شرطی که همه‌ی رشته‌های must_have (اسم آهنگ/خواننده) توی
+    متنِ تمیزشده‌ی صفحه باشن. بخش نظرات قبل از استخراج بریده می‌شه تا کامنت‌ها
+    به‌جای متن آهنگ نیان."""
+    import html as _html
+    txt = re.sub(r"<br\s*/?>", "\n", _ir_clean(body), flags=re.I)
+    txt = re.sub(r"</(p|div|h\d|li|span)>", "\n", txt, flags=re.I)
+    txt = re.sub(r"<[^>]+>", "", txt)
+    lines = [ln.strip() for ln in _html.unescape(txt).splitlines() if ln.strip()]
+    joined = "\n".join(lines)
+    for mh in must_have:
+        if mh and mh not in joined:
+            return None
+    anchor = None
+    for i, ln in enumerate(lines):
+        if "متن آهنگ" in ln:
+            anchor = i
+            break
+    if anchor is None:
+        return None
+    # نظرات همیشه بعد از متن آهنگن — از اونجا به بعد رو ببر
+    for i in range(anchor + 1, len(lines)):
+        if "دیدگاه" in lines[i] or "نظرات" in lines[i]:
+            lines = lines[:i]
+            break
+    start = None
+    for j in range(anchor + 1, len(lines)):
+        if _ir_looks_like_verse(lines[j]) and not _IR_UI.search(lines[j]):
+            start = j
+            break
+    if start is None:
+        return None
+    text = _ir_block_from(lines, start)
+    if text and len(text) >= 200:
+        return text
+    return None
+
+
 async def _fetch_ir_site_lyrics(artist, title, query=None, keys_override=None):
     """جایگزین MusicXMatch: متن کامل آهنگ از سایت‌های موزیک ایرانی (رایگان، بدون کلید).
 
@@ -378,10 +418,19 @@ async def _fetch_ir_site_lyrics(artist, title, query=None, keys_override=None):
     if keys_override:
         keys = list(keys_override)
     q = query or f"{title.strip()} {artist or ''} متن آهنگ".strip()
-    return await asyncio.to_thread(_ir_site_sync, q, keys)
+    fa_words = [w for w in title.strip().split() if re.search(r"[؀-ۿ]", w)]
+    must_have = []
+    if len(fa_words) >= 2:
+        must_have.append(" ".join(fa_words[-2:]))
+    elif fa_words:
+        must_have.append(fa_words[0])
+    fa_artist = " ".join(w for w in (artist or "").split() if re.search(r"[؀-ۿ]", w)).strip()
+    if fa_artist:
+        must_have.append(fa_artist)
+    return await asyncio.to_thread(_ir_site_sync, q, keys, must_have)
 
 
-def _ir_site_sync(q, keys):
+def _ir_site_sync(q, keys, must_have=()):
     """جستجو+دریافتِ هم‌زمان (تو thread) — curl_cffi چون DDG فینگرپرینت aiohttp رو چلنج می‌کنه."""
     try:
         import curl_cffi.requests as _cr
@@ -421,8 +470,9 @@ def _ir_site_sync(q, keys):
             pass
     # ترتیب ترجیح: اول سایت‌های متن‌محور/سریع، بعد بقیه (مثل tarafdari که از IP خارجی فیلتره)
     prefer = ("lachini.com", "systemmusic.ir", "songsara.net", "musicdel.ir", "irtext.ir",
+              "rozmusic.com", "ahaang.com", "irjavan.com", "playmusic.ir",
               "lyricstranslate.com", "krakenmusic.ir", "melonmusic.ir", "opxmusic.ir", "imimusic.ir",
-              "tarafdari.com")
+              "navahang.com", "tarafdari.com")
     try:
         candidates.sort(key=lambda u: next((i for i, d in enumerate(prefer) if d in u), 99))
     except Exception:
@@ -435,6 +485,14 @@ def _ir_site_sync(q, keys):
             continue
         if rp.status_code != 200:
             continue
+        if must_have:
+            try:
+                out = _ir_extract_longest(rp.text, must_have)
+            except Exception as e:
+                print(f"[lyrics] ir-site longest: {e}", flush=True)
+                out = None
+            if out:
+                return out
         for k in keys:
             try:
                 out = _ir_extract(rp.text, k)
@@ -500,7 +558,7 @@ def _genius_sync(queries, must_contain=None):
             _time.sleep(2)
         for q in queries[:4]:
             try:
-                resp = s.get("https://genius.com/api/search/multi?per_page=5&q=" + _up.quote(q), timeout=15)
+                resp = s.get("https://genius.com/api/search/multi?per_page=5&q=" + _up.quote(q), timeout=8)
                 if resp.status_code != 200:
                     continue
                 sections = (resp.json().get("response") or {}).get("sections") or []
@@ -633,7 +691,7 @@ async def fetch_lyrics(artist, title, raw_title=None):
         if simple_title and simple_title not in lr_queries:
             lr_queries.append(simple_title)
 
-    for q in lr_queries:
+    for q in lr_queries[:8]:
         hit = await _fetch_lrclib({
             "mode": "search",
             "qs": _up.urlencode({"q": q}),
