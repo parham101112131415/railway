@@ -10,4 +10,3 @@ requests
 numpy
 Pillow
 python-dotenv
-imageio-ffmpeg
