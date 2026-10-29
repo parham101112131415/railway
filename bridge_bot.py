@@ -3659,16 +3659,22 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
             # برمی‌داره که باعث می‌شه آهنگ کاملاً غلط دانلود شه (مثل «Call My
             # Name» به‌جای چیزی که AudD تشخیص داده بود).
             chosen = None
+            candidates = list(entries)
             if artist or title:
                 q = f"{artist} {title}".strip().lower()
                 target_words = [w for w in re.split(r"\s+", q) if len(w) > 2]
-                for e in entries:
-                    t_low = (e.get("title") or "").lower()
-                    if any(w in t_low for w in target_words):
-                        chosen = e
-                        break
+                matched = [e for e in entries
+                           if any(w in (e.get("title") or "").lower() for w in target_words)]
+                if matched:
+                    rest = [e for e in entries if e not in matched]
+                    candidates = matched + rest
+                    chosen = matched[0]
             if not chosen:
                 chosen = entries[0]
+            # فال‌بک دانلود: تا ۴ آپلود اول نگه داشته می‌شن؛ اگه دانلود اولی
+            # از یوتیوب نشد (مثلاً آپلود Topic که از آی‌پی سرور فرمت نمی‌ده)،
+            # بقیه به‌ترتیب امتحان می‌شن تا یکی دانلود بشه.
+            candidates = candidates[:4]
             t = chosen.get("title") or "بدون عنوان"
             uploader = chosen.get("channel") or chosen.get("uploader") or "ناشناس"
             duration = chosen.get("duration")
@@ -3732,8 +3738,34 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
                     sess["idx"] = sess.get("idx", 0) + 1
                     await process_next_in_batch(update, ctx)
                 else:
-                    await run_single_job(update, ctx, job)
-                    await send_spotify_link_if_available(chat_id, ctx, search_query)
+                    result = await run_single_job(update, ctx, job, quiet_fail=True)
+                    if not result and result != "__cancelled__":
+                        # آپلود اول دانلود نشد — آپلودهای جایگزین رو امتحان کن
+                        for cand in candidates[1:]:
+                            cand_url = cand.get("url") or cand.get("webpage_url") or cand.get("id")
+                            if cand_url and "http" not in str(cand_url):
+                                cand_url = f"https://www.youtube.com/watch?v={cand_url}"
+                            if not cand_url:
+                                continue
+                            print(f"[music] آپلود جایگزین: {cand.get('title')!r}", flush=True)
+                            await msg.edit_text(f"🎵 {t}\n⬇️ در حال دانلود (تلاش جایگزین)...")
+                            job2 = dict(job)
+                            job2["url"] = cand_url
+                            job2["inf"] = cand
+                            job2.pop("_cancel_id", None)
+                            try:
+                                cand_thumb = cand.get("thumbnail") or (cand.get("thumbnails") or [{}])[-1].get("url")
+                            except Exception:
+                                cand_thumb = None
+                            if cand_thumb:
+                                job2["tag_cover_url"] = cand_thumb
+                            result = await run_single_job(update, ctx, job2, quiet_fail=True)
+                            if result or result == "__cancelled__":
+                                break
+                    if result and result != "__cancelled__":
+                        await send_spotify_link_if_available(chat_id, ctx, search_query)
+                    elif result != "__cancelled__":
+                        await msg.edit_text("❌ دانلود ناموفق بود — چند آپلود مختلف این آهنگ امتحان شد ولی یوتیوب هیچ‌کدوم رو از این سرور نمی‌ده.")
             return
 
         kb = []
@@ -5608,7 +5640,7 @@ def _job_size_bytes(job):
     return int(inf.get("filesize") or inf.get("filesize_approx") or 0)
 
 
-async def run_single_job(update, ctx, job, queue_info=None):
+async def run_single_job(update, ctx, job, queue_info=None, quiet_fail=False):
     """
     queue_info (اختیاری): {"idx": 1, "total": 5, "remaining_bytes": 123}
     برای نمایش زمان کل باقی‌ماندهٔ صف روی نوار پیشرفت.
@@ -5747,10 +5779,16 @@ async def run_single_job(update, ctx, job, queue_info=None):
                 pass
             await prog_msg.edit_text("🚫 دانلود لغو شد.")
             CANCEL_EVENTS.pop(job.get("_cancel_id"), None)
-            return
+            return "__cancelled__"
         state["done"] = True
         await task
-        await prog_msg.edit_text(f"❌ دانلود ناموفق بود: {e}")
+        if quiet_fail:
+            try:
+                await prog_msg.delete()
+            except Exception:
+                pass
+        else:
+            await prog_msg.edit_text(f"❌ دانلود ناموفق بود: {e}")
         return
     state["done"] = True
     await task
@@ -6179,10 +6217,16 @@ async def run_single_job(update, ctx, job, queue_info=None):
                 except Exception:
                     pass
     else:
-        try:
-            await prog_msg.edit_text("❌ دانلود ناموفق بود.")
-        except Exception:
-            pass
+        if quiet_fail:
+            try:
+                await prog_msg.delete()
+            except Exception:
+                pass
+        else:
+            try:
+                await prog_msg.edit_text("❌ دانلود ناموفق بود.")
+            except Exception:
+                pass
     return sent_msg
 
 
