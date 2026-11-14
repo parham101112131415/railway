@@ -5656,6 +5656,9 @@ _HARVEST_WAITERS = {}
 _HARVEST_PENDING = {}
 _HARVEST_LOCK = asyncio.Lock()
 _HARVESTER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".venv", "bin", "python")
+if not os.path.exists(_HARVESTER_PY):
+    # روی ریلوی .venv نیست — همون پایتون جاری
+    _HARVESTER_PY = sys.executable
 _HARVESTER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harvest_genesis.py")
 
 

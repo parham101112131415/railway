@@ -17,15 +17,22 @@ genesis_harvest.session (egress via ghost-xray SOCKS5 10808).
 import argparse, asyncio, os, re, sys, time
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 import socks
 
 BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "id-lookup-bot"))
 ENV = {}
-for line in open(os.path.join(BASE, ".env"), encoding="utf-8"):
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1)
-        ENV[k.strip()] = v.strip()
+_env_file = os.path.join(BASE, ".env")
+if os.path.exists(_env_file):
+    for line in open(_env_file, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            ENV[k.strip()] = v.strip()
+# روی ریلوی اون فایل نیست — API_ID/API_HASH از متغیرهای محیطی میان
+for _k in ("API_ID", "API_HASH"):
+    if os.environ.get(_k):
+        ENV[_k] = os.environ[_k]
 
 SESSION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "genesis_harvest")
 GENESIS = "parham_test_1_bot"
@@ -151,8 +158,20 @@ async def main():
     if not args.query and not args.link:
         ap.error("--query or --link is required")
 
-    client = TelegramClient(SESSION, int(ENV["API_ID"]), ENV["API_HASH"],
-                            proxy=(socks.SOCKS5, "127.0.0.1", 10808))
+    # سشن: روی ریلوی از متغیر مخفی GENESIS_SESSION_STRING (رشته‌ی سشن)،
+    # اینجا از فایل genesis_harvest.session. پروکسی: پیش‌فرض ساکس محلی؛
+    # حالت رشته‌ای (ریلوی) مستقیم وصل می‌شه مگر HARVEST_PROXY ست شده باشه.
+    _sess_str = os.environ.get("GENESIS_SESSION_STRING")
+    _session = StringSession(_sess_str) if _sess_str else SESSION
+    _proxy = (socks.SOCKS5, "127.0.0.1", 10808)
+    _hp = os.environ.get("HARVEST_PROXY")
+    if _hp == "none" or (_sess_str and not _hp):
+        _proxy = None
+    elif _hp and ":" in _hp:
+        _h, _p = _hp.rsplit(":", 1)
+        _proxy = (socks.SOCKS5, _h, int(_p))
+    client = TelegramClient(_session, int(ENV["API_ID"]), ENV["API_HASH"],
+                            proxy=_proxy)
     await client.connect()
     if not await client.is_user_authorized():
         print("NOT_AUTHORIZED", flush=True)

@@ -11,3 +11,5 @@ numpy
 Pillow
 python-dotenv
 imageio-ffmpeg
+telethon
+PySocks
