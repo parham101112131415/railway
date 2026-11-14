@@ -18,6 +18,34 @@ import socket
 import bridge_config as cfg
 import yt_dlp
 
+# HOST FIX (Mahsa VM): this host's egress proxy forges TLS certs for media CDN
+# hosts (self-signed chain), so yt-dlp downloads die with CERTIFICATE_VERIFY_FAILED.
+# When BOT_NO_CHECK_CERT=1, force nocheckcertificate on every YoutubeDL instance
+# in this process (media downloads only; the Telegram API client is separate).
+if os.environ.get("BOT_NO_CHECK_CERT") == "1":
+    _orig_ydl_init = yt_dlp.YoutubeDL.__init__
+
+    def _ydl_init_hostfix(self, params=None, *args, **kwargs):
+        params = dict(params or {})
+        params.setdefault("nocheckcertificate", True)
+        return _orig_ydl_init(self, params, *args, **kwargs)
+
+    yt_dlp.YoutubeDL.__init__ = _ydl_init_hostfix
+
+# HOST FIX (Mahsa VM): the ACRCloud session is built without trust_env, so on
+# this host it connects directly and dies (intercepted egress, WRONG_VERSION_NUMBER).
+# Default trust_env=True for every aiohttp session when BOT_KEEP_PROXY=1.
+if os.environ.get("BOT_KEEP_PROXY") == "1":
+    import aiohttp as _aiohttp
+
+    _orig_session_init = _aiohttp.ClientSession.__init__
+
+    def _session_init_hostfix(self, *args, **kwargs):
+        kwargs.setdefault("trust_env", True)
+        return _orig_session_init(self, *args, **kwargs)
+
+    _aiohttp.ClientSession.__init__ = _session_init_hostfix
+
 # downloader.py را لود ميكنيم (همان فايل ترمينالي)
 import importlib.util
 spec = importlib.util.spec_from_file_location("dl", cfg.DOWNLOADER_PATH)
@@ -80,7 +108,7 @@ except Exception:
     TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, Update,
+    InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile,
     InputMediaDocument, InputMediaPhoto, ReplyKeyboardMarkup, KeyboardButton,
 )
 from telegram.constants import ParseMode
@@ -100,7 +128,7 @@ except Exception:
             pass
 
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, ApplicationHandlerStop, CommandHandler, MessageHandler,
     CallbackQueryHandler, InlineQueryHandler, filters, ContextTypes,
 )
 
@@ -111,6 +139,14 @@ URL_RE = dl.URL_RE
 # quality select, lyrics/translate/LRC, nightcore/slowed, similar songs, inline.
 import spotify_music as _music
 _music.OWNER_IDS = set(getattr(cfg, "OWNER_ID", ()) or ())
+
+# ---- instagram profile picture fetcher ----
+try:
+    import ig_profile as _igp
+    IGP_OK = True
+except Exception:
+    _igp = None
+    IGP_OK = False
 
 # ---- per-user access control (managed in-bot via /users) ----
 import user_access as ua
@@ -1996,7 +2032,28 @@ def _quality_menu_items(inf):
                     continue
                 seen.add(res)
                 fs = f.get("filesize") or f.get("filesize_approx")
+                est = False
+                if not fs:
+                    # یوتیوب برای خیلی از فرمت‌ها حجم نمی‌ده — از بیت‌ریت تخمین بزن
+                    dur = inf.get("duration") or 0
+                    tbr = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0)) or None
+                    if not tbr or not dur:
+                        for g in formats:
+                            if g.get("vcodec") != "none" and g.get("height") == res:
+                                gfs = g.get("filesize") or g.get("filesize_approx")
+                                if gfs:
+                                    fs, est = gfs, True
+                                    break
+                                if not tbr:
+                                    tbr = g.get("tbr") or None
+                    if not fs and tbr and dur:
+                        fs = tbr * 125 * dur
+                        if f.get("acodec") == "none":
+                            fs += 128 * 125 * dur  # صدای جدا که موقع دانلود مرج می‌شه
+                        est = True
                 size_str = dl.human_size(fs) if fs and hasattr(dl, "human_size") else ""
+                if size_str and est:
+                    size_str = "~" + size_str
                 menu.append((res, f.get("ext"), f.get("format_id"), size_str))
                 break
     return menu
@@ -3188,7 +3245,103 @@ async def _reel_audio_preload(url, video_path):
         print(f"[song-id] پیش‌استخراج صدا ناموفق: {type(e).__name__}", flush=True)
 
 
-async def identify_song_from_url(url, on_status=None):
+
+_FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+                           "01234567890123456789")
+
+# راهنمایی ثانیه‌ی شروع تشخیص آهنگ، به‌ازای هر چت: {"url","start","ts"}
+_SONG_START_HINTS = {}
+
+
+def _parse_song_start_hint(text):
+    """از متن پیامِ همراه لینک، (url, seconds) شروع تشخیص رو درمیاره یا None.
+
+    فرمت‌ها: «لینک 20» | «لینک 0:20» | «از ۲۰» | «ثانیه ۲۰» | «۲۰ ثانیه» | «@20»
+    """
+    try:
+        if not text:
+            return None
+        m = re.search(r"https?://[^\s]+", text)
+        if not m:
+            return None
+        url = m.group(0).rstrip(").,،»\"'")
+        rest = (text[:m.start()] + " " + text[m.end():]).translate(_FA_DIGITS)
+        start = None
+        mm = re.search(r"(\d{1,3}):(\d{1,2})", rest)
+        if mm:
+            start = int(mm.group(1)) * 60 + int(mm.group(2))
+        else:
+            mm = (re.search(r"(?:از|ثانیه|شروع|start)\s*(\d{1,4})", rest, flags=re.I)
+                  or re.search(r"(\d{1,4})\s*ثانیه", rest)
+                  or re.search(r"@\s*(\d{1,4})", rest))
+            if mm:
+                start = int(mm.group(1))
+            elif re.fullmatch(r"\s*\d{1,4}\s*", rest or ""):
+                start = int(rest.strip())
+        if start is None or not (0 < start < 3600):
+            return None
+        return url, float(start)
+    except Exception:
+        return None
+
+
+def _take_song_start_hint(chat_id, url):
+    """هینت ذخیره‌شده برای همین لینک رو برمی‌گردونه و پاکش می‌کنه (یا None)."""
+    try:
+        h = _SONG_START_HINTS.get(chat_id)
+        if not h:
+            return None
+        if time.time() - h.get("ts", 0) > 1800:
+            _SONG_START_HINTS.pop(chat_id, None)
+            return None
+        if _canon_url(h.get("url") or "") != _canon_url(url or ""):
+            return None
+        _SONG_START_HINTS.pop(chat_id, None)
+        return float(h.get("start") or 0) or None
+    except Exception:
+        return None
+
+
+def _peek_song_start_hint(chat_id, url):
+    """مثل _take ولی پاک نمی‌کنه — فقط میگه برای این لینک هینت معتبر هست یا نه."""
+    try:
+        h = _SONG_START_HINTS.get(chat_id)
+        if not h:
+            return None
+        if time.time() - h.get("ts", 0) > 1800:
+            return None
+        if _canon_url(h.get("url") or "") != _canon_url(url or ""):
+            return None
+        return float(h.get("start") or 0) or None
+    except Exception:
+        return None
+
+
+def _parse_time_token(text):
+    """فقط یه زمان از متن درمیاره: «20» | «0:20» | «از ۲۰» | «ثانیه ۲۰» | «۲۰ ثانیه» | «@20» → ثانیه یا None."""
+    try:
+        if not text:
+            return None
+        rest = str(text).translate(_FA_DIGITS)
+        mm = re.search(r"(\d{1,3}):(\d{1,2})", rest)
+        if mm:
+            v = int(mm.group(1)) * 60 + int(mm.group(2))
+        else:
+            mm = (re.search(r"(?:از|ثانیه|شروع|start)\s*(\d{1,4})", rest, flags=re.I)
+                  or re.search(r"(\d{1,4})\s*ثانیه", rest)
+                  or re.search(r"@\s*(\d{1,4})", rest))
+            if mm:
+                v = int(mm.group(1))
+            elif re.fullmatch(r"\s*\d{1,4}\s*", rest or ""):
+                v = int(rest.strip())
+            else:
+                return None
+        return float(v) if 0 < v < 3600 else None
+    except Exception:
+        return None
+
+
+async def identify_song_from_url(url, on_status=None, start_at=0.0):
     """
     صدای ویدیو رو فقط یک‌بار دانلود می‌کنه (نه دوبار مثل قبل) و به ترتیب امتحان
     می‌کنه: ۱) اثرانگشت صدا با AudD (دقیق‌ترین، اگه AUDD_API_TOKEN ست باشه)
@@ -3202,20 +3355,27 @@ async def identify_song_from_url(url, on_status=None):
     """
     if not url:
         return None, None, None, None, False
+    try:
+        start_at = max(0.0, float(start_at or 0))
+    except Exception:
+        start_at = 0.0
     print(f"[song-id] شروع تشخیص برای: {url}", flush=True)
 
     # بهینه‌سازی ۱: کش نتایج — اگه این لینک قبلاً تشخیص داده شده، فوری برگردون
-    cached = _song_cache_get(url)
-    if cached:
-        print(f"[song-id] از کش اومد: {cached[0]}", flush=True)
-        return cached
+    if not start_at:
+        cached = _song_cache_get(url)
+        if cached:
+            print(f"[song-id] از کش اومد: {cached[0]}", flush=True)
+            return cached
 
     # بهینه‌سازی ۲: مسیر سریع اینستا — اسم آهنگ از خود صفحه (بدون دانلود صدا)
     # فقط برای ریلزهایی که از موزیک کتابخونه اینستا استفاده کردن جواب میده
-    try:
-        emb = await asyncio.to_thread(_instagram_embed_song_name, url)
-    except Exception:
-        emb = None
+    emb = None
+    if not start_at:
+        try:
+            emb = await asyncio.to_thread(_instagram_embed_song_name, url)
+        except Exception:
+            emb = None
     if emb:
         query, artist, title = emb
         result = (query, artist, title, "instagram", True)
@@ -3241,6 +3401,24 @@ async def identify_song_from_url(url, on_status=None):
         print(f"[song-id] دانلود صدا برای تشخیص چیزی نداد (raw_path={raw_path!r})", flush=True)
         return None, None, None, None
     print(f"[song-id] صدا دانلود شد: {audio_path}", flush=True)
+    if start_at > 0:
+        # کاربر ثانیه‌ی شروع داده — فقط از همون‌جا به بعد (۳۰ ثانیه) تشخیص بده
+        _clip = f"{audio_path}.from{int(start_at)}.mp3"
+        try:
+            _proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-ss", f"{start_at:.2f}", "-t", "30",
+                "-i", audio_path, "-vn", "-ac", "2", "-ar", "44100",
+                "-b:a", "128k", _clip,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(_proc.communicate(), timeout=60)
+            if os.path.exists(_clip) and os.path.getsize(_clip) > 2000:
+                print(f"[song-id] برش از ثانیه‌ی {start_at:.0f}: {_clip}", flush=True)
+                audio_path = _clip
+            else:
+                print("[song-id] برش ناموفق → کل صدا", flush=True)
+        except Exception as e:
+            print(f"[song-id] برش خطا: {type(e).__name__} → کل صدا", flush=True)
 
     try:
         # بهینه‌سازی ۳+۴: هر سه موتور تشخیص (AudD / Shazam / ACRCloud) رو
@@ -3310,7 +3488,8 @@ async def identify_song_from_url(url, on_status=None):
                 print(f"[song-id] AudD confident={confident} (score={audd_score:.2f})", flush=True)
                 if confident:
                     result = (query, artist, title, "audd", True)
-                    _song_cache_set(url, result)
+                    if not start_at:
+                        _song_cache_set(url, result)
                     return result
                 print("[song-id] AudD ضعیف بود → ادامه با بقیه", flush=True)
 
@@ -3323,7 +3502,8 @@ async def identify_song_from_url(url, on_status=None):
                 query = f"{artist} {title}".strip() if artist else title
                 print(f"[song-id] Shazam confident → {artist} - {title}", flush=True)
                 result = (query, artist, title, "shazam", True)
-                _song_cache_set(url, result)
+                if not start_at:
+                    _song_cache_set(url, result)
                 return result
 
         # اولویت ۳: ACRCloud
@@ -3334,7 +3514,8 @@ async def identify_song_from_url(url, on_status=None):
                 query = f"{artist} {title}".strip() if artist else title
                 print(f"[song-id] ACRCloud confident → {artist} - {title}", flush=True)
                 result = (query, artist, title, "acrcloud", True)
-                _song_cache_set(url, result)
+                if not start_at:
+                    _song_cache_set(url, result)
                 return result
 
         # مرحله ۲: رونویسی متن/شعر (STT) و جستجو از روی اون.
@@ -3354,7 +3535,8 @@ async def identify_song_from_url(url, on_status=None):
             _dur = float((out or b"0").decode(errors="ignore").strip() or 0)
         except Exception:
             _dur = 0.0
-        if _dur > 0 and _dur < 20:
+        _min_stt = 8
+        if _dur > 0 and _dur < _min_stt:
             print(f"[song-id] صدا کوتاهه ({_dur:.0f}s) → STT رد شد", flush=True)
             return None, None, None, None, False
         if on_status:
@@ -3763,7 +3945,7 @@ async def search_song_from_lyrics_text(chat_id, ctx, text, cb_prefix, result_key
     )
 
 
-async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, result_key, update=None, auto_pick=False, artist=None, title=None, extra_queries=None, count=5, silent_not_found=False):
+async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, result_key, update=None, auto_pick=False, artist=None, title=None, extra_queries=None, count=5, silent_not_found=False, genesis_url=None):
     """
     جستجوی یوتیوب برای یک عبارت مشخص.
     auto_pick=True: چون آهنگ خودمون (از متادیتا یا AudD) تشخیص داده شده، به‌جای نمایش
@@ -3777,6 +3959,9 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
     count: تعداد نتیجه‌ی هر جستجو (ytsearchN).
     """
     msg = await ctx.bot.send_message(chat_id, f"🔍 جستجوی آهنگ: {search_query}")
+    if genesis_url:
+        # لینک ریلز برای دکمه‌ی جنسیس — مسیر انتخاب دستی (igms) هم از سشن می‌خونه
+        SESS.setdefault(chat_id, {})[result_key + "_genesis_url"] = genesis_url
 
     # نکته‌ی مهم: برای «جستجو» فقط عنوان/مدت‌زمان/کاور لازمه، نه فرمت‌های دانلود.
     # قبلاً extract_info بدون extract_flat هر کدوم از ۵ نتیجه رو کامل پردازش
@@ -3798,6 +3983,13 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
     async def _search_one(q):
         found = []
         err = None
+        # لاین سریع: اول innertube — یه کال مستقیم، بدون اسکرپ yt-dlp
+        try:
+            _fast = await asyncio.to_thread(_yt_innertube_search, q, max(count * 2, 10))
+        except Exception:
+            _fast = []
+        if _fast:
+            return _fast, None
         for use_cookies in (False, True):
             try:
                 result = await _try_search(q, use_cookies)
@@ -3872,14 +4064,40 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
             if artist or title:
                 q = f"{artist} {title}".strip().lower()
                 target_words = [w for w in re.split(r"\s+", q) if len(w) > 2]
-                matched = [e for e in entries
-                           if any(w in (e.get("title") or "").lower() for w in target_words)]
+
+                def _match_score(e):
+                    hay = ((e.get("title") or "") + " " + (e.get("channel") or e.get("uploader") or "")).lower()
+                    return sum(1 for w in target_words if w in hay)
+
+                _need = 2 if len(target_words) >= 2 else 1
+                matched = [e for e in entries if _match_score(e) >= _need]
                 if matched:
-                    rest = [e for e in entries if e not in matched]
-                    candidates = matched + rest
+                    matched.sort(key=_match_score, reverse=True)
+                    candidates = matched
                     chosen = matched[0]
-            if not chosen:
+            if not chosen and not (artist or title):
                 chosen = entries[0]
+            if not chosen:
+                # تشخیص داریم ولی هیچ آپلود مطمئنی تو یوتیوب نیست — فایل
+                # هم‌اسمِ نامربوط خودکار نفرست؛ لیست رو نشون بده خودش انتخاب کنه.
+                print(f"[music] auto_pick: نتیجهٔ مطمئن نیست برای {artist!r} {title!r}", flush=True)
+                kb2 = []
+                for i, e in enumerate(entries[:5]):
+                    _t2 = e.get("title") or "بدون عنوان"
+                    _d2 = e.get("duration")
+                    _ds2 = ""
+                    if _d2:
+                        _m2, _s2 = divmod(int(_d2), 60)
+                        _ds2 = f" ({_m2}:{_s2:02d})"
+                    kb2.append([InlineKeyboardButton(f"🎵 {_t2}{_ds2}", callback_data=f"{cb_prefix}:{i}")])
+                kb2.append([InlineKeyboardButton("❌ لغو", callback_data=f"{cb_prefix}:cancel")])
+                SESS.setdefault(chat_id, {})[result_key] = entries[:5]
+                await msg.edit_text(
+                    f"🎧 آهنگ تشخیص داده شد: {(artist or '')} — {(title or '')}\n"
+                    "ولی آپلود مطمئنی ازش تو یوتیوب پیدا نشد که خودکار بفرستم.\n"
+                    "اگه یکی از اینا درسته خودت انتخاب کن:",
+                    reply_markup=InlineKeyboardMarkup(kb2))
+                return
             # فال‌بک دانلود: تا ۴ آپلود اول نگه داشته می‌شن؛ اگه دانلود اولی
             # از یوتیوب نشد (مثلاً آپلود Topic که از آی‌پی سرور فرمت نمی‌ده)،
             # بقیه به‌ترتیب امتحان می‌شن تا یکی دانلود بشه.
@@ -3932,7 +4150,7 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
 
             # دانلود و ارسال فایل صوتی + دکمه‌ی متن آهنگ
             if chosen_url:
-                await msg.edit_text(f"🎵 {t}\n⬇️ در حال دانلود...")
+                await msg.edit_text(f"🎵 {t}\n⏳ در حال آوردن آهنگ...")
                 job = await make_song_download_job(
                     chosen if isinstance(chosen, dict) else {"url": chosen_url, "title": t},
                     artist=lyrics_artist,
@@ -3940,6 +4158,8 @@ async def search_and_send_music_options(chat_id, ctx, search_query, cb_prefix, r
                 )
                 if thumb_url:
                     job["tag_cover_url"] = thumb_url
+                if genesis_url:
+                    _attach_genesis_retry(job, genesis_url)
                 sess = SESS.get(chat_id) or {}
                 if sess.get("mode") == "batch":
                     # چند لینک: بره تو صف و لینک بعدی
@@ -4641,6 +4861,31 @@ async def handle_link(update, ctx):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
     print(f"[link] got: {text[:80]}", flush=True)
+    try:
+        _hint = _parse_song_start_hint(text)
+        if _hint:
+            _SONG_START_HINTS[chat_id] = {
+                "url": _hint[0], "start": _hint[1], "ts": time.time()}
+            print(f"[link] song start hint: {_hint[1]:.0f}s", flush=True)
+        elif "http" in text:
+            _SONG_START_HINTS.pop(chat_id, None)
+            _sx = SESS.get(chat_id)
+            if _sx:
+                _sx.pop("awaiting_song_start", None)
+                _sx.pop("pending_song", None)
+    except Exception:
+        pass
+
+    # جواب ثانیه برای دکمه‌ی «ثانیه رو خودم میگم»
+    _aws = (SESS.get(chat_id) or {}).get("awaiting_song_start")
+    if _aws and "http" not in text and len(text) <= 12:
+        _sec = _parse_time_token(text)
+        if _sec is not None:
+            SESS[chat_id].pop("awaiting_song_start", None)
+            await execute_ig_song_extract(
+                update, ctx, _aws.get("url"), _aws.get("inf") or {},
+                start_at=_sec)
+            return
 
     _uid = update.effective_user.id if update.effective_user else None
     _is_owner = _uid in cfg.OWNER_ID if _uid else False
@@ -5059,25 +5304,710 @@ async def show_queue_editor(update, ctx, chat_id, edit_message=None):
     await ctx.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="Markdown")
 
 
-async def start_single(update, ctx, url):
-    chat_id = update.effective_chat.id
-    msg = await update.message.reply_text("در حال دریافت اطلاعات ویدیو... ⏳")
-    for attempt in range(2):
+
+def _best_progressive_ig(inf):
+    """بهترین فرمت آماده‌ی اینستا (صدا+تصویر توی یه فایل) برای ارسال با لینک مستقیم.
+
+    فرمت‌های DASH جدا acodec/vcodec=none دارن؛ آماده‌ها هر دو None هستن.
+    بین آماده‌ها اونی که ابعاد/بیت‌ریتش بالاتره انتخاب می‌شه (مساوی → آخری)."""
+    best, best_key = None, None
+    for f in (inf or {}).get("formats") or []:
+        if not f.get("url"):
+            continue
+        if f.get("vcodec") in ("none",) or f.get("acodec") in ("none",):
+            continue
+        if f.get("vcodec") and f.get("acodec"):
+            continue
+        key = (f.get("height") or 0, f.get("width") or 0, f.get("tbr") or 0)
+        if best is None or key >= best_key:
+            best, best_key = f, key
+    return best
+
+
+def _reel_caption(inf, limit=1000):
+    """کپشن ویدیو از اطلاعات ریلز — سقف کپشن تلگرام ~۱۰۲۴ کاراکتره."""
+    txt = build_meta_text(inf, with_desc=False)
+    desc = ((inf or {}).get("description") or "").strip()
+    if desc:
+        room = limit - len(txt) - 10
+        if room > 30:
+            d = desc if len(desc) <= room else desc[:room].rstrip() + "…"
+            txt = f"{txt}\n💬 کپشن:\n{d}"
+    return txt[:limit]
+
+
+
+_REEL_CACHE_FILE = os.path.join(DATA_DIR, "reel_instant_cache.json")
+_REEL_CACHE = None
+
+
+def _reel_shortcode(url):
+    m = re.search(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url or "")
+    return m.group(1) if m else None
+
+
+def _reel_cache_load():
+    global _REEL_CACHE
+    if _REEL_CACHE is None:
         try:
-            inf = await asyncio.wait_for(asyncio.to_thread(dl.info, url), timeout=40)
-        except asyncio.TimeoutError:
-            if attempt < 1:
-                await asyncio.sleep(5)
-                continue
-            await msg.edit_text("❌ خطا در دریافت اطلاعات: زمان زیادی طول کشید (احتمالاً مشکل شبکه/پروکسی)")
+            with open(_REEL_CACHE_FILE, encoding="utf-8") as f:
+                _REEL_CACHE = json.load(f)
+        except Exception:
+            _REEL_CACHE = {}
+    return _REEL_CACHE
+
+
+def _reel_cache_get(url):
+    code = _reel_shortcode(url)
+    if not code:
+        return None
+    return _reel_cache_load().get(code)
+
+
+def _reel_cache_put(url, inf, file_id):
+    try:
+        code = _reel_shortcode(url)
+        if not code or not file_id:
+            return
+        cache = _reel_cache_load()
+        subset = {k: (inf or {}).get(k) for k in (
+            "title", "uploader", "channel", "uploader_id", "channel_id",
+            "description", "duration", "view_count", "like_count",
+            "comment_count", "upload_date")}
+        cache[code] = {"file_id": file_id, "inf": subset, "ts": time.time()}
+        if len(cache) > 500:
+            old = sorted(cache, key=lambda x: cache[x].get("ts", 0))
+            for k in old[:len(cache) - 500]:
+                cache.pop(k, None)
+        tmp = _REEL_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, _REEL_CACHE_FILE)
+    except Exception:
+        pass
+
+
+async def _send_reel_cached(ctx, chat_id, msg, url):
+    """ریلزی که قبلاً ارسال شده رو با file_id درجا می‌فرسته — بدون هیچ درخواستی به اینستا."""
+    ent = _reel_cache_get(url)
+    if not ent or not ent.get("file_id"):
+        return False
+    einf = ent.get("inf") or {}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 پیدا کردن آهنگ", callback_data="ig_audio")],
+        [InlineKeyboardButton("🎬 پیدا کردن فیلم", callback_data="ig_movie")],
+    ])
+    try:
+        await tg_call(ctx.bot.send_video, chat_id, ent["file_id"],
+                      caption=_reel_caption(einf), reply_markup=kb,
+                      supports_streaming=True)
+    except Exception:
+        return False
+    SESS[chat_id] = {"mode": "single", "url": url, "inf": einf,
+                     "is_audio": False, "selected_q": set()}
+    if msg:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    print(f"[ig] ارسال از کش file_id: {str(url)[:60]}", flush=True)
+    return True
+
+
+
+_IG_WEB = {"session": None}
+
+
+def _ig_web_cookies():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig_cookies.txt")
+    cookies = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                elif line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies[parts[5]] = parts[6]
+    except Exception:
+        pass
+    return cookies
+
+
+def _ig_fast_resolve(url):
+    """رزولو سریع ریلز با سشن وب اینستا — inf کامل + لینک مستقیم ویدیو.
+    هر خطایی (سشن مرده و...) None میده تا مسیر yt-dlp بره."""
+    try:
+        import requests as _rq
+        m = re.search(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url or "")
+        if not m:
+            return None
+        cookies = _ig_web_cookies()
+        if not cookies.get("sessionid"):
+            return None
+        alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        pk = 0
+        for ch in m.group(1):
+            pk = pk * 64 + alpha.index(ch)
+        if _IG_WEB["session"] is None:
+            _IG_WEB["session"] = _rq.Session()
+        sess = _IG_WEB["session"]
+        sess.cookies.clear()
+        sess.cookies.update(cookies)
+        r = sess.get(
+            f"https://i.instagram.com/api/v1/media/{pk}/info/",
+            headers={"x-ig-app-id": "936619743392459",
+                     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"},
+            timeout=12, verify=False)
+        if r.status_code != 200:
+            print(f"[ig] رزولو سریع ناموفق: HTTP {r.status_code}", flush=True)
+            return None
+        item = (r.json().get("items") or [None])[0]
+        if not item:
+            return None
+        versions = [v for v in (item.get("video_versions") or []) if v.get("url")]
+        if not versions:
+            return None
+        best = max(versions, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))
+        cap = ((item.get("caption") or {}).get("text") or "").strip()
+        user = (item.get("user") or {}).get("username") or ""
+        _mai = ((item.get("clips_metadata") or {}).get("music_info") or {}).get("music_asset_info") or {}
+        _mtitle = (_mai.get("title") or "").strip()
+        _martist = (_mai.get("display_artist") or "").strip()
+        title = (cap.split("\n")[0][:90] if cap else "") or "ریلز اینستاگرام"
+        upload_date = ""
+        try:
+            import datetime as _dt
+            upload_date = _dt.datetime.fromtimestamp(item.get("taken_at") or 0).strftime("%Y%m%d")
+        except Exception:
+            pass
+        inf = {
+            "id": str(item.get("pk") or ""),
+            "title": title,
+            "track": _mtitle or None,
+            "artist": _martist or None,
+            "uploader": user,
+            "channel": user,
+            "uploader_id": str((item.get("user") or {}).get("pk") or ""),
+            "description": cap,
+            "duration": item.get("video_duration"),
+            "view_count": item.get("play_count") or item.get("view_count"),
+            "like_count": item.get("like_count"),
+            "comment_count": item.get("comment_count"),
+            "upload_date": upload_date,
+            "webpage_url": url,
+            "ext": "mp4",
+            "formats": [{
+                "format_id": "igweb", "url": best["url"],
+                "width": best.get("width"), "height": best.get("height"),
+                "ext": "mp4",
+            }],
+            "_ig_fast": True,
+        }
+        print(f"[ig] رزولو سریع OK: {m.group(1)}", flush=True)
+        return inf
+    except Exception as e:
+        print(f"[ig] رزولو سریع خطا: {type(e).__name__}", flush=True)
+        return None
+
+
+
+def _yt_innertube_search(q, count=10):
+    """جستجوی یوتیوب با API داخلی خود یوتیوب (innertube) — یه POST، بدون yt-dlp.
+    خروجی: لیست entry به شکل yt-dlp flat (id/title/url/duration/channel/thumbnail)."""
+    try:
+        import requests as _rq
+        r = _rq.post(
+            "https://www.youtube.com/youtubei/v1/search?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+            json={"context": {"client": {"clientName": "WEB", "clientVersion": "2.20240111.09.00"}},
+                  "query": q},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+                     "Content-Type": "application/json"},
+            timeout=10, verify=False)
+        if r.status_code != 200:
+            return []
+        out, seen = [], set()
+
+        def _walk(node):
+            if len(out) >= count:
+                return
+            if isinstance(node, dict):
+                vr = node.get("videoRenderer")
+                if isinstance(vr, dict):
+                    vid = vr.get("videoId")
+                    if vid and vid not in seen:
+                        seen.add(vid)
+                        _t = vr.get("title") or {}
+                        if _t.get("runs"):
+                            title = "".join(x.get("text", "") for x in _t["runs"])
+                        else:
+                            title = _t.get("simpleText") or ""
+                        _lb = vr.get("longBylineText") or vr.get("shortBylineText") or {}
+                        chan = ""
+                        if _lb.get("runs"):
+                            chan = _lb["runs"][0].get("text", "")
+                        dur = None
+                        _lt = (vr.get("lengthText") or {}).get("simpleText")
+                        if _lt:
+                            try:
+                                dur = 0
+                                for _p in _lt.split(":"):
+                                    dur = dur * 60 + int(_p)
+                            except Exception:
+                                dur = None
+                        thumbs = ((vr.get("thumbnail") or {}).get("thumbnails") or [])
+                        thumb = thumbs[-1].get("url") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                        if dur:
+                            out.append({
+                                "id": vid, "title": title,
+                                "url": f"https://www.youtube.com/watch?v={vid}",
+                                "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                                "duration": dur, "channel": chan, "uploader": chan,
+                                "thumbnail": thumb, "thumbnails": thumbs or [{"url": thumb}],
+                            })
+                    return
+                for _v in node.values():
+                    _walk(_v)
+            elif isinstance(node, list):
+                for _v in node:
+                    _walk(_v)
+
+        _walk(r.json())
+        return out
+    except Exception as e:
+        print(f"[music] جستجوی innertube ناموفق: {type(e).__name__}", flush=True)
+        return []
+
+
+_SONG_FID_FILE = os.path.join(DATA_DIR, "song_fid_cache.json")
+_SONG_FID = None
+
+
+def _song_fid_load():
+    global _SONG_FID
+    if _SONG_FID is None:
+        try:
+            with open(_SONG_FID_FILE, encoding="utf-8") as f:
+                _SONG_FID = json.load(f)
+        except Exception:
+            _SONG_FID = {}
+    return _SONG_FID
+
+
+def _song_fid_key(url, title, artist, vid=None):
+    m = re.search(r"(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})", url or "")
+    if m:
+        return "yt:" + m.group(1)
+    if vid and re.fullmatch(r"[\w-]{11}", str(vid)):
+        return "yt:" + str(vid)
+    t = re.sub(r"\s+", " ", (title or "")).strip().lower()
+    a = re.sub(r"\s+", " ", (artist or "")).strip().lower()
+    if t:
+        return f"q:{a}|{t}"
+    return None
+
+
+def _song_fid_get(job):
+    try:
+        inf = job.get("inf") or {}
+        key = _song_fid_key(job.get("url"), job.get("tag_title"),
+                            job.get("tag_artist"), inf.get("id"))
+        if not key:
+            return None
+        ent = _song_fid_load().get(key)
+        if ent and ent.get("file_id"):
+            return ent
+    except Exception:
+        pass
+    return None
+
+
+def _song_fid_put(job, file_id):
+    try:
+        inf = job.get("inf") or {}
+        key = _song_fid_key(job.get("url"), job.get("tag_title"),
+                            job.get("tag_artist"), inf.get("id"))
+        if not key or not file_id:
+            return
+        cache = _song_fid_load()
+        cache[key] = {"file_id": file_id, "src": "own",
+                      "title": job.get("tag_title") or "",
+                      "artist": job.get("tag_artist") or "",
+                      "duration": inf.get("duration"),
+                      "ts": time.time()}
+        if len(cache) > 1000:
+            old = sorted(cache, key=lambda x: cache[x].get("ts", 0))
+            for k in old[:len(cache) - 1000]:
+                cache.pop(k, None)
+        tmp = _SONG_FID_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, _SONG_FID_FILE)
+        print(f"[fastlane] file_id آهنگ ذخیره شد: {key}", flush=True)
+    except Exception:
+        pass
+
+
+
+_HARVEST_WAITERS = {}
+_HARVEST_PENDING = {}
+_HARVEST_LOCK = asyncio.Lock()
+_HARVESTER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".venv", "bin", "python")
+_HARVESTER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harvest_genesis.py")
+
+
+async def _hvkey_cmd(update, ctx):
+    """دستور داخلی هاروستر (فقط مالک): قبل از فوروارد آهنگ /hvkey و موقع خطا /hvfail میاد."""
+    try:
+        uid = update.effective_user.id if update.effective_user else None
+        if uid not in cfg.OWNER_ID:
+            return
+        text = (update.message.text or "") if update.message else ""
+        _kp = text.split(None, 1)
+        key = _kp[1].strip() if len(_kp) > 1 else ""
+        if not key:
+            return
+        if text.startswith("/hvfail"):
+            fut = _HARVEST_WAITERS.pop(key, None)
+            if fut and not fut.done():
+                fut.set_result(None)
+        else:
+            _HARVEST_PENDING[update.effective_chat.id] = (key, time.time() + 180)
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def _harvest_capture(update, ctx):
+    """آدیوی فورواردشده از هاروستر: file_id همین بات رو ذخیره و منتظر رو بیدار کن."""
+    msg = update.effective_message
+    if not msg:
+        return
+    chat_id = update.effective_chat.id
+    pend = _HARVEST_PENDING.get(chat_id)
+    if not pend or pend[1] < time.time():
+        return
+    key, _exp = pend
+    _HARVEST_PENDING.pop(chat_id, None)
+    audio = msg.audio or msg.document
+    if not audio:
+        return
+    fid = audio.file_id
+    try:
+        cache = _song_fid_load()
+        cache[key] = {"file_id": fid, "src": "genesis",
+                      "title": getattr(audio, "title", "") or "",
+                      "artist": getattr(audio, "performer", "") or "",
+                      "duration": getattr(audio, "duration", None),
+                      "thumb_fid": (audio.thumbnail.file_id
+                                    if getattr(audio, "thumbnail", None) else ""),
+                      "ts": time.time()}
+        tmp = _SONG_FID_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, _SONG_FID_FILE)
+        print(f"[harvest] file_id گرفته شد: {key}", flush=True)
+    except Exception as e:
+        print(f"[harvest] ذخیره file_id ناموفق: {e}", flush=True)
+    fut = _HARVEST_WAITERS.pop(key, None)
+    if fut and not fut.done():
+        fut.set_result(fid)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def _harvest_from_genesis(job):
+    """برداشت آهنگ از بات جنسیس با اکانت مالک — خروجی: file_id این بات یا None."""
+    key = _song_fid_key(job.get("url"), job.get("tag_title"),
+                        job.get("tag_artist"), (job.get("inf") or {}).get("id"))
+    query = f"{job.get('tag_artist') or ''} {job.get('tag_title') or ''}".strip()
+    if not key or not query:
+        return None
+    if _HARVEST_LOCK.locked():
+        return None
+    async with _HARVEST_LOCK:
+        fut = asyncio.get_event_loop().create_future()
+        _HARVEST_WAITERS[key] = fut
+        proc = None
+        try:
+            print(f"[harvest] برداشت از جنسیس: {query!r} (key={key})", flush=True)
+            _hlog = open(os.path.join(DATA_DIR, "harvest.log"), "ab")
+            proc = await asyncio.create_subprocess_exec(
+                _HARVESTER_PY, _HARVESTER_SCRIPT, "--key", key, "--query", query,
+                stdout=_hlog, stderr=_hlog)
+            try:
+                fid = await asyncio.wait_for(asyncio.shield(fut), timeout=110)
+                return fid
+            except asyncio.TimeoutError:
+                print("[harvest] تایم‌اوت برداشت → مسیر عادی", flush=True)
+                return None
+        except Exception as e:
+            print(f"[harvest] خطا: {type(e).__name__}", flush=True)
+            return None
+        finally:
+            _HARVEST_WAITERS.pop(key, None)
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+def _reel_shortcode(url):
+    m = re.search(r"(?:reels?|p)/([A-Za-z0-9_-]+)", url or "")
+    return m.group(1) if m else None
+
+
+# رجیستری دکمه‌ی «این نیست؟ از جنسیس بیار»: {shortcode: reel_url}
+_GENESIS_RETRY_URLS = {}
+
+
+def _attach_genesis_retry(job, url):
+    """زیر آهنگی که خودِ بات از ریلز پیدا کرده، دکمه‌ی جنسیس می‌ذاره و
+    فلگ no_genesis_harvest رو ست می‌کنه تا ارسال این جاب بی‌صدا از
+    جنسیس نیاد — جنسیس برای ریلز فقط با زدن همین دکمه وارد می‌شه."""
+    sc = _reel_shortcode(url)
+    if not sc:
+        return
+    _GENESIS_RETRY_URLS[sc] = url
+    while len(_GENESIS_RETRY_URLS) > 200:
+        _GENESIS_RETRY_URLS.pop(next(iter(_GENESIS_RETRY_URLS)))
+    job["no_genesis_harvest"] = True
+    btn = InlineKeyboardButton(
+        "❌ این نیست؟ از جنسیس بیار", callback_data=f"genretry:{sc}")
+    mk = job.get("extra_markup")
+    rows = [list(r) for r in mk.inline_keyboard] if mk else []
+    rows.append([btn])
+    job["extra_markup"] = InlineKeyboardMarkup(rows)
+
+
+async def _harvest_reel_link_from_genesis(url):
+    """خودِ لینک ریلز رو می‌ده به جنسیس تا خودش آهنگ رو شناسایی و استخراج
+    کنه (نه پایپ‌لاین تشخیص خودمون) — خروجی: file_id این بات یا None."""
+    sc = _reel_shortcode(url)
+    if not sc:
+        return None
+    key = f"reel:{sc}"
+    try:
+        _ent = _song_fid_load().get(key)
+        if _ent and _ent.get("file_id"):
+            print(f"[harvest] لینک ریلز از کش file_id: {key}", flush=True)
+            return _ent["file_id"]
+    except Exception:
+        pass
+    if _HARVEST_LOCK.locked():
+        return None
+    async with _HARVEST_LOCK:
+        fut = asyncio.get_event_loop().create_future()
+        _HARVEST_WAITERS[key] = fut
+        proc = None
+        try:
+            print(f"[harvest] برداشت لینک ریلز از جنسیس: {url} (key={key})", flush=True)
+            _hlog = open(os.path.join(DATA_DIR, "harvest.log"), "ab")
+            proc = await asyncio.create_subprocess_exec(
+                _HARVESTER_PY, _HARVESTER_SCRIPT, "--key", key, "--link", url,
+                stdout=_hlog, stderr=_hlog)
+            try:
+                fid = await asyncio.wait_for(asyncio.shield(fut), timeout=165)
+                return fid
+            except asyncio.TimeoutError:
+                print("[harvest] تایم‌اوت برداشت لینک ریلز → مسیر عادی", flush=True)
+                return None
+        except Exception as e:
+            print(f"[harvest] خطا در برداشت لینک ریلز: {type(e).__name__}", flush=True)
+            return None
+        finally:
+            _HARVEST_WAITERS.pop(key, None)
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+async def _fetch_full_info_retry(title, artist, duration):
+    """اطلاعات کامل آهنگ با یه تلاش مجدد — قطع لحظه‌ای اتصال (ریست egress)
+    نباید کاور و پرونده رو با هم بکشه."""
+    for _att in range(2):
+        try:
+            _full = await asyncio.wait_for(
+                asyncio.to_thread(_music.fetch_full_info, title, artist, None,
+                                  duration),
+                timeout=25)
+            if _full:
+                return _full
+        except Exception:
+            pass
+        if _att == 0:
+            await asyncio.sleep(2)
+    return None
+
+
+async def _send_genesis_reel_cover(ctx, chat_id, key, full=None):
+    """قبل از آدیوی جنسیس، کاور آهنگ رو جدا می‌فرسته (مثل مسیر تشخیص خودمون):
+    اول کاور XL از fetch_full_info با اسم/خواننده‌ای که از فایل جنسیس خونده
+    شده؛ اگه پیدا نشد، تامبنیل خودِ فایل جنسیس — ولی با دانلود بایت‌هاش، چون
+    تلگرام file_id تامبنیل رو به‌عنوان عکس قبول نمی‌کنه."""
+    try:
+        ent = _song_fid_load().get(key) or {}
+    except Exception:
+        ent = {}
+    title = (ent.get("title") or "").strip()
+    artist = (ent.get("artist") or "").strip()
+    cap = f"🎵 {(artist + ' — ') if artist else ''}{title}".strip()
+    caption = cap if (title or artist) else None
+    if full is None and (title or artist):
+        full = await _fetch_full_info_retry(title, artist, ent.get("duration"))
+    _cov = (full or {}).get("cover_url")
+    if _cov:
+        try:
+            await ctx.bot.send_photo(chat_id, photo=_cov, caption=caption)
             return
         except Exception as e:
-            if attempt < 1:
-                await asyncio.sleep(5)
-                continue
-            await msg.edit_text(f"❌ خطا در دریافت اطلاعات: {e}")
+            print(f"[harvest] ارسال کاور XL ناموفق: {e}", flush=True)
+    _thumb = ent.get("thumb_fid")
+    if _thumb:
+        try:
+            import io
+            _tgf = await ctx.bot.get_file(_thumb)
+            _raw = await _tgf.download_as_bytearray()
+            await ctx.bot.send_photo(
+                chat_id, photo=io.BytesIO(bytes(_raw)), caption=caption)
             return
-        break
+        except Exception as e:
+            print(f"[harvest] ارسال تامبنیل جنسیس ناموفق: {e}", flush=True)
+    print("[harvest] کاوری برای آهنگ جنسیس پیدا نشد — فقط آدیو می‌ره", flush=True)
+
+
+async def _send_genesis_reel_song(ctx, chat_id, key, fid):
+    """تحویل آهنگ برداشت‌شده از جنسیس برای ریلز تکی: کاور جدا، خودِ آدیو
+    عیناً (بدون دست‌کاری تگ/عنوان)، دکمه‌ی «متن آهنگ» زیر آدیو و پرونده‌ی
+    کامل بعدش — دقیقاً مثل بقیه‌ی مسیرهای ارسال آهنگ."""
+    try:
+        ent = _song_fid_load().get(key) or {}
+    except Exception:
+        ent = {}
+    title = (ent.get("title") or "").strip()
+    artist = (ent.get("artist") or "").strip()
+    duration = ent.get("duration")
+    # اطلاعات کامل یه بار گرفته می‌شه؛ هم کاور ازش استفاده می‌کنه هم پرونده
+    _full = None
+    if title or artist:
+        _full = await _fetch_full_info_retry(title, artist, duration)
+    await _send_genesis_reel_cover(ctx, chat_id, key, full=_full)
+    # دکمه‌ی متن آهنگ — دقیقاً با همون الگوی مسیر استاندارد
+    extra_markup = None
+    if title:
+        lyrics_text = None
+        try:
+            lyrics_text = await asyncio.wait_for(
+                fetch_lyrics(artist, title, raw_title=title), timeout=20)
+        except Exception:
+            lyrics_text = None
+        lyrics_id = _cache_lyrics_ref(
+            artist, title, lyrics_text, raw=f"{artist} {title}".strip())
+        extra_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 متن آهنگ", callback_data=f"lyrics:{lyrics_id}")]
+        ])
+    await ctx.bot.send_audio(
+        chat_id, audio=fid, reply_markup=extra_markup,
+        read_timeout=600, write_timeout=600)
+    # پرونده‌ی کامل آهنگ — همیشه فرستاده می‌شه؛ فیلد خالی «---» می‌خوره
+    try:
+        _info = _full or {
+            "title": title, "artist": artist,
+            "duration": _music.fmt_duration(duration) if duration else None,
+        }
+        _fm = []
+        if duration:
+            _fm.append(_music.fmt_duration(int(duration)))
+        for _p in _music.chunk(_music.build_dossier(_info, _fm), 4000):
+            await ctx.bot.send_message(chat_id, _p)
+    except Exception as e:
+        print(f"[harvest] ارسال پرونده ناموفق: {e}", flush=True)
+
+
+async def _send_reel_instant(ctx, chat_id, msg, url, inf):
+    """ریلز اینستا رو درجا با لینک مستقیم می‌فرسته — خود تلگرام فایل رو از
+    CDN اینستا می‌کشه، سرور ما بایتی جابه‌جا نمی‌کنه. موفق → True."""
+    fmt = _best_progressive_ig(inf)
+    if not fmt:
+        return False
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 پیدا کردن آهنگ", callback_data="ig_audio")],
+        [InlineKeyboardButton("🎬 پیدا کردن فیلم", callback_data="ig_movie")],
+    ])
+    try:
+        sent = await tg_call(
+            ctx.bot.send_video, chat_id, fmt["url"],
+            caption=_reel_caption(inf),
+            reply_markup=kb,
+            supports_streaming=True,
+        )
+    except Exception as e:
+        print(f"[ig] ارسال فوری ناموفق ({type(e).__name__}) → کارت قدیمی", flush=True)
+        return False
+    if msg:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    print(f"[ig] ارسال فوری ریلز انجام شد: {str(url)[:60]}", flush=True)
+    try:
+        return sent.video.file_id if sent and sent.video else True
+    except Exception:
+        return True
+
+
+async def start_single(update, ctx, url):
+    chat_id = update.effective_chat.id
+    # ریلز اینستا: اول بدون پیام انتظار امتحان کن — کش یا رزولو سریع + ارسال فوری
+    if dl.is_instagram_url(url) and dl.is_reel_url(url):
+        if await _send_reel_cached(ctx, chat_id, None, url):
+            return
+        _finf = await asyncio.to_thread(_ig_fast_resolve, url)
+        if _finf:
+            SESS[chat_id] = {"mode": "single", "url": url, "inf": _finf,
+                             "is_audio": False, "selected_q": set()}
+            _fid = await _send_reel_instant(ctx, chat_id, None, url, _finf)
+            if _fid is not False:
+                if isinstance(_fid, str):
+                    _reel_cache_put(url, _finf, _fid)
+                return
+    msg = await update.message.reply_text("در حال دریافت اطلاعات ویدیو... ⏳")
+    # کش ارسال فوری: ریلزی که قبلاً فرستاده شده با file_id درجا میاد
+    if dl.is_instagram_url(url) and dl.is_reel_url(url):
+        if await _send_reel_cached(ctx, chat_id, msg, url):
+            return
+    inf = None
+    if dl.is_instagram_url(url) and dl.is_reel_url(url):
+        inf = await asyncio.to_thread(_ig_fast_resolve, url)
+    if not inf:
+        for attempt in range(2):
+            try:
+                inf = await asyncio.wait_for(asyncio.to_thread(dl.info, url), timeout=40)
+            except asyncio.TimeoutError:
+                if attempt < 1:
+                    await asyncio.sleep(5)
+                    continue
+                await msg.edit_text("❌ خطا در دریافت اطلاعات: زمان زیادی طول کشید (احتمالاً مشکل شبکه/پروکسی)")
+                return
+            except Exception as e:
+                if attempt < 1:
+                    await asyncio.sleep(5)
+                    continue
+                await msg.edit_text(f"❌ خطا در دریافت اطلاعات: {e}")
+                return
+            break
 
     # انتخاب قبلی همین لینک؟
     pref = get_link_pref(url)
@@ -5205,6 +6135,20 @@ async def start_single(update, ctx, url):
         return
     SESS[chat_id] = {"mode": "single", "url": url, "inf": inf, "is_audio": False, "selected_q": set()}
     if dl.is_reel_url(url):
+        if dl.is_instagram_url(url):
+            _fid = await _send_reel_instant(ctx, chat_id, msg, url, inf)
+            if _fid is not False:
+                if isinstance(_fid, str):
+                    _reel_cache_put(url, inf, _fid)
+                return
+            if inf.get("_ig_fast"):
+                try:
+                    _full = await asyncio.wait_for(asyncio.to_thread(dl.info, url), timeout=40)
+                    if _full:
+                        inf = _full
+                        SESS[chat_id]["inf"] = _full
+                except Exception:
+                    pass
         await tg_call(
             msg.edit_text,
             build_meta_text(inf) + "\n\n" + _reel_menu_title(url),
@@ -5770,9 +6714,11 @@ async def generate_and_send_subtitled_video(update, ctx, chat_id, url, inf):
                 pass
 
 
-async def execute_ig_song_extract(update, ctx, url, inf):
+async def execute_ig_song_extract(update, ctx, url, inf, start_at=None):
     """تشخیص + دانلود آهنگ اینستا (برای تک‌لینک یا وقتی از صف اجرا می‌شه)."""
     chat_id = update.effective_chat.id
+    if start_at is None:
+        start_at = _take_song_start_hint(chat_id, url)
     key = (chat_id, url)
     if key in _SONG_BUSY:
         # همون لینک قبلاً در حال پردازشه — دوباره اجرا نکن (لوپ)
@@ -5809,13 +6755,16 @@ async def execute_ig_song_extract(update, ctx, url, inf):
             _res = await search_and_send_music_options(
                 chat_id, ctx, search_query, cb_prefix="igms",
                 result_key="_ig_music_results", update=update, auto_pick=True,
-                silent_not_found=True,
+                silent_not_found=True, genesis_url=url,
             )
             if _res != "NOT_FOUND":
                 return True
             print(f"[song-id] متادیتا ({search_query!r}) نتیجه نداد → تشخیص از روی صدا", flush=True)
 
-        wait_msg = await ctx.bot.send_message(chat_id, "🎧 در حال شنیدن صدای ویدیو...")
+        _wait_txt = "🎧 در حال شنیدن صدای ویدیو..."
+        if start_at:
+            _wait_txt = f"🎧 در حال شنیدن صدای ویدیو (از ثانیهٔ {int(start_at)})..."
+        wait_msg = await ctx.bot.send_message(chat_id, _wait_txt)
 
         async def _status(text):
             try:
@@ -5823,7 +6772,7 @@ async def execute_ig_song_extract(update, ctx, url, inf):
             except Exception:
                 pass
 
-        search_query, audd_artist, audd_title, src, confident = await identify_song_from_url(url, on_status=_status)
+        search_query, audd_artist, audd_title, src, confident = await identify_song_from_url(url, on_status=_status, start_at=start_at or 0.0)
         try:
             await wait_msg.delete()
         except Exception:
@@ -5837,6 +6786,7 @@ async def execute_ig_song_extract(update, ctx, url, inf):
                 result_key="_ig_music_results", update=update,
                 auto_pick=confident,
                 artist=audd_artist, title=audd_title,
+                genesis_url=url,
             )
             return True
 
@@ -5868,9 +6818,54 @@ async def run_single_job(update, ctx, job, queue_info=None, quiet_fail=False):
     chat_id = update.effective_chat.id
     # جاب معوق استخراج آهنگ اینستا (از صف چندلینک)
     if job.get("ig_extract_song"):
-        await execute_ig_song_extract(update, ctx, job.get("url"), job.get("inf") or {})
+        await execute_ig_song_extract(update, ctx, job.get("url"), job.get("inf") or {}, start_at=job.get("song_start"))
         return None
     url = job["url"]
+    # لاین سریع (مکانیزم جنسیس): اطلاعات کامل آهنگ هم‌زمان با دانلود گرفته می‌شه
+    # و آهنگی که قبلاً ارسال شده با file_id تلگرام درجا میاد — بدون دانلود و آپلود.
+    if job.get("is_audio") and (job.get("tag_title") or job.get("tag_artist")):
+        try:
+            _wd0 = (job.get("inf") or {}).get("duration")
+            job["_fullinfo_fut"] = asyncio.ensure_future(asyncio.to_thread(
+                _music.fetch_full_info, job.get("tag_title") or "",
+                job.get("tag_artist") or "", None, int(_wd0) if _wd0 else None))
+        except Exception:
+            pass
+        _fid_ent = _song_fid_get(job)
+        if not _fid_ent and queue_info is None and not job.get("no_genesis_harvest"):
+            _hfid = await _harvest_from_genesis(job)
+            if _hfid:
+                _fid_ent = {"file_id": _hfid, "src": "genesis",
+                            "duration": (job.get("inf") or {}).get("duration")}
+        if _fid_ent:
+            try:
+                _exact = _fid_ent.get("src") == "genesis"
+                sent_msg = await ctx.bot.send_audio(
+                    chat_id, audio=_fid_ent["file_id"],
+                    caption=job.get("caption") or f"🎵 {job.get('tag_title') or ''}",
+                    title=None if _exact else (job.get("tag_title") or None),
+                    performer=None if _exact else (job.get("tag_artist") or None),
+                    reply_markup=job.get("extra_markup"),
+                    read_timeout=600, write_timeout=600)
+                job["file_id"] = _fid_ent["file_id"]
+                print(f"[fastlane] ارسال با file_id کش: {job.get('tag_title')!r}", flush=True)
+                try:
+                    _full = await job["_fullinfo_fut"]
+                except Exception:
+                    _full = None
+                if _full:
+                    job["full_info"] = _full
+                    try:
+                        _fm = []
+                        if _fid_ent.get("duration"):
+                            _fm.append(_music.fmt_duration(int(_fid_ent["duration"])))
+                        for _p in _music.chunk(_music.build_dossier(_full, _fm), 4000):
+                            await ctx.bot.send_message(chat_id, _p)
+                    except Exception as e:
+                        print(f"[fastlane] ارسال پرونده ناموفق: {e}", flush=True)
+                return sent_msg
+            except Exception as e:
+                print(f"[fastlane] file_id ناموفق ({type(e).__name__}) → مسیر عادی", flush=True)
     cancel_event = asyncio.Event()
     job["_cancel_id"] = f"{chat_id}:{id(job)}"
     CANCEL_EVENTS[job["_cancel_id"]] = cancel_event
@@ -6145,6 +7140,28 @@ async def run_single_job(update, ctx, job, queue_info=None, quiet_fail=False):
                 )
             except Exception as e:
                 print(f"[tag] تگ‌گذاری ID3 ناموفق: {e}", flush=True)
+            # اطلاعات کامل آهنگ (دیزر/آیتونز/موزیک‌برینز) + تگ‌های اضافهٔ ID3
+            try:
+                _fut = job.get("_fullinfo_fut")
+                if _fut is not None:
+                    try:
+                        _full = await _fut
+                    except Exception:
+                        _full = None
+                else:
+                    _wd = (job.get("inf") or {}).get("duration")
+                    _full = await asyncio.to_thread(
+                        _music.fetch_full_info,
+                        job.get("tag_title") or "",
+                        job.get("tag_artist") or "",
+                        None,
+                        int(_wd) if _wd else None,
+                    )
+                if _full:
+                    job["full_info"] = _full
+                    await asyncio.to_thread(_music.apply_full_tags, path, _full)
+            except Exception as e:
+                print(f"[fullinfo] ناموفق: {e}", flush=True)
             try:
                 save_found_song({
                     "title": job.get("tag_title"),
@@ -6327,12 +7344,33 @@ async def run_single_job(update, ctx, job, queue_info=None, quiet_fail=False):
                                 read_timeout=3600, write_timeout=3600,
                             )
                     else:
-                        sent_msg = await ctx.bot.send_document(
-                            chat_id, document=pf,
-                            caption="✅ دانلود تمام شد",
-                            reply_markup=extra_markup,
-                            read_timeout=3600, write_timeout=3600,
-                        )
+                        _v_exts = (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".ts", ".avi")
+                        if os.path.splitext(path)[1].lower() in _v_exts:
+                            try:
+                                sent_msg = await ctx.bot.send_video(
+                                    chat_id, video=pf,
+                                    caption="✅ دانلود تمام شد",
+                                    supports_streaming=True,
+                                    reply_markup=extra_markup,
+                                    read_timeout=3600, write_timeout=3600,
+                                )
+                            except Exception as ev:
+                                print(f"[done] send_video failed, fallback to document: {ev}", flush=True)
+                                f.seek(0)
+                                pf = _UploadProgressFile(f, sz)
+                                sent_msg = await ctx.bot.send_document(
+                                    chat_id, document=pf,
+                                    caption="✅ دانلود تمام شد",
+                                    reply_markup=extra_markup,
+                                    read_timeout=3600, write_timeout=3600,
+                                )
+                        else:
+                            sent_msg = await ctx.bot.send_document(
+                                chat_id, document=pf,
+                                caption="✅ دانلود تمام شد",
+                                reply_markup=extra_markup,
+                                read_timeout=3600, write_timeout=3600,
+                            )
 
                 elapsed = max(0.5, time.time() - t_start)
                 real_bps = sz / elapsed
@@ -6365,6 +7403,8 @@ async def run_single_job(update, ctx, job, queue_info=None, quiet_fail=False):
                     if sent_file_id:
                         job["file_id"] = sent_file_id
                         update_ig_catalog_file_id(path, sent_file_id)
+                        if job.get("is_audio"):
+                            _song_fid_put(job, sent_file_id)
                         print(f"[telegram-cache] file_id ذخیره شد برای {os.path.basename(path)}", flush=True)
                 except Exception as e:
                     print(f"[telegram-cache] ذخیره file_id ناموفق: {e}", flush=True)
@@ -6447,6 +7487,27 @@ async def run_single_job(update, ctx, job, queue_info=None, quiet_fail=False):
                 await prog_msg.edit_text("❌ دانلود ناموفق بود.")
             except Exception:
                 pass
+    # پروندهٔ کامل آهنگ، بلافاصله بعد از ارسال خود آهنگ
+    if sent_msg and job.get("full_info"):
+        try:
+            _fm = []
+            try:
+                if path and os.path.exists(path):
+                    _fm.append(f"{os.path.getsize(path) / 1048576:.1f}MB")
+            except Exception:
+                pass
+            try:
+                from mutagen.mp3 import MP3 as _MP3
+                _au = _MP3(path)
+                if _au is not None and _au.info is not None:
+                    _fm.insert(0, _music.fmt_duration(int(_au.info.length)))
+                    _fm.insert(0, f"{int(_au.info.bitrate / 1000)}kbps")
+            except Exception:
+                pass
+            for _p in _music.chunk(_music.build_dossier(job["full_info"], _fm), 4000):
+                await ctx.bot.send_message(chat_id, _p)
+        except Exception as e:
+            print(f"[fullinfo] ارسال پرونده ناموفق: {e}", flush=True)
     return sent_msg
 
 
@@ -7308,6 +8369,22 @@ async def button(update, ctx):
             pass
         return
 
+    # ─── دکمه‌ی «از اول بگیر» روی پیام پرسش ثانیه ───
+    if data == "songstart:0":
+        _aws0 = (s or {}).get("awaiting_song_start") or {}
+        purl, pinf = _aws0.get("url"), _aws0.get("inf")
+        if not purl:
+            await q.answer("منقضی شده — لینک رو دوباره بفرست", show_alert=True)
+            return
+        s.pop("awaiting_song_start", None)
+        _take_song_start_hint(chat_id, purl)  # هینت متنی قدیمی رو دور بریز
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await execute_ig_song_extract(update, ctx, purl, pinf, start_at=0.0)
+        return
+
     # ─── Instagram: پیدا کردن آهنگ کامل ───
     if data == "ig_audio":
         if not s:
@@ -7321,10 +8398,11 @@ async def button(update, ctx):
             await ctx.bot.send_message(chat_id, "❌ اطلاعات ویدیو نیست — دوباره لینک بفرست")
             return
 
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
+        if not getattr(q.message, "video", None):
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
 
         # چند لینک: فقط تو صف بذار — الان دانلود/تشخیص نکن
         if s.get("mode") == "batch":
@@ -7333,6 +8411,7 @@ async def button(update, ctx):
                 "inf": inf,
                 "is_audio": True,
                 "ig_extract_song": True,
+                "song_start": _take_song_start_hint(chat_id, url),
                 "send_to_telegram": True,
                 "ig_kind": "song",
             }
@@ -7353,8 +8432,24 @@ async def button(update, ctx):
             await process_next_in_batch(update, ctx)
             return
 
-        # تک‌لینک: همان لحظه تشخیص و دانلود
-        await execute_ig_song_extract(update, ctx, url, inf)
+        # قبلاً اینجا لینک اول می‌رفت جنسیس و پرسش ثانیه رد می‌شد — به دستور
+        # پرهام (۲۰۲۶-۱۱-۱۵) حذف شد: بات خودش می‌گرده؛ جنسیس فقط با دکمه‌ی
+        # «این نیست؟ از جنسیس بیار» زیر آهنگِ فرستاده‌شده صدا زده می‌شه.
+
+        # تک‌لینک: یه پیام میاد — یا عدد ثانیه رو می‌نویسه یا دکمه‌ی از اول رو می‌زنه
+        # (اگه با خود لینک ثانیه گفته باشه، دیگه نمی‌پرسیم)
+        if _peek_song_start_hint(chat_id, url) is not None:
+            await execute_ig_song_extract(update, ctx, url, inf)
+            return
+        s["awaiting_song_start"] = {"url": url, "inf": inf}
+        _kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏮ از اول بگیر", callback_data="songstart:0")],
+        ])
+        await tg_call(
+            ctx.bot.send_message, chat_id,
+            "🎧 از چه ثانیه‌ای آهنگو تشخیص بدم؟\n"
+            "عددشو بنویس (مثلاً 20 یا 0:20) — یا دکمه‌ی از اول رو بزن 👇",
+            reply_markup=_kb)
         return
 
     # ─── Instagram: شناسایی فیلم با جستجوی تصویری واقعی گوگل لنز (SerpApi) ───
@@ -7375,10 +8470,11 @@ async def button(update, ctx):
             return
 
         await q.answer("🎬 در حال آماده‌سازی...")
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
+        if not getattr(q.message, "video", None):
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
         wait_msg = await ctx.bot.send_message(chat_id, "🔎 لینک دریافت شد؛ در حال شروع تشخیص…")
 
         async def _mv_status(text):
@@ -7564,6 +8660,34 @@ async def button(update, ctx):
             )
         return
 
+    # ─── دکمه‌ی «این نیست؟ از جنسیس بیار» زیر آهنگِ پیداشده توسط خود بات ───
+    if data.startswith("genretry:"):
+        if not _is_owner_q:
+            await q.answer("فقط مالک می‌تونه از جنسیس بیاره", show_alert=True)
+            return
+        _gurl = _GENESIS_RETRY_URLS.get(data[len("genretry:"):])
+        if not _gurl:
+            await q.answer("منقضی شده — لینک رو دوباره بفرست", show_alert=True)
+            return
+        await q.answer("🎵 میدمش به جنسیس...")
+        _gw = None
+        try:
+            _gw = await tg_call(ctx.bot.send_message, chat_id, "⏳ جنسیس داره می‌گرده...")
+        except Exception:
+            pass
+        _gfid = await _harvest_reel_link_from_genesis(_gurl)
+        if _gw is not None:
+            try:
+                await _gw.delete()
+            except Exception:
+                pass
+        if _gfid:
+            await _send_genesis_reel_song(
+                ctx, chat_id, f"reel:{_reel_shortcode(_gurl)}", _gfid)
+        else:
+            await tg_call(ctx.bot.send_message, chat_id, "❌ جنسیس هم نتونست اینو پیدا کنه")
+        return
+
     if data.startswith("igms:"):
         if not s:
             await q.answer("منقضی شده", show_alert=True)
@@ -7599,6 +8723,9 @@ async def button(update, ctx):
         except Exception:
             pass
         job = await _job_from_music_pick(chat_id, ctx, chosen)
+        _gurl = s.get("_ig_music_results_genesis_url")
+        if _gurl:
+            _attach_genesis_retry(job, _gurl)
         if s.get("mode") == "batch":
             # مثل یوتیوب: بره تو صف جاب‌ها و لینک بعدی
             s.setdefault("jobs", []).append(job)
@@ -7640,7 +8767,7 @@ async def button(update, ctx):
 
         _SONG_BUSY[_key] = True
         try:
-            search_query, audd_artist, audd_title, src, confident = await identify_song_from_url(url, on_status=_status)
+            search_query, audd_artist, audd_title, src, confident = await identify_song_from_url(url, on_status=_status, start_at=(_take_song_start_hint(chat_id, url) or 0.0))
         finally:
             _SONG_BUSY.pop(_key, None)
         try:
@@ -8209,11 +9336,67 @@ def _sweep_stale_downloads():
         print(f"[sweep] خطا: {exc}", flush=True)
 
 
+
+# ---- اینستاگرام: عکس پروفایل ----
+class _IgProfileFilter(filters.UpdateFilter):
+    """لینک پروفایل اینستا یا @یوزرنیم — فقط برای مالک/کاربرای مجاز."""
+
+    def filter(self, update):
+        if not IGP_OK:
+            return False
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return False
+        user = update.effective_user
+        if not user:
+            return False
+        allowed = set(list(getattr(cfg, "OWNER_ID", ()) or ()) +
+                      list(getattr(cfg, "LIMITED_USERS", ()) or ()))
+        if user.id not in allowed:
+            return False
+        return bool(_igp.extract_usernames(msg.text))
+
+
+async def ig_profile_handler(update, ctx):
+    text = update.message.text or ""
+    if text.startswith("/"):
+        parts = text.split(None, 1)
+        text = parts[1] if len(parts) > 1 else ""
+    targets = _igp.extract_usernames(text)
+    if not targets:
+        await update.message.reply_text(
+            "📸 یه لینک پروفایل اینستا یا @یوزرنیم بفرست تا عکس پروفایلش رو بگیرم.")
+        return
+    for uname in targets:
+        prof = await asyncio.to_thread(_igp.fetch_profile, uname)
+        if not prof:
+            await update.message.reply_text(f"❌ @{uname} پیدا نشد یا خطا خورد.")
+            continue
+        caption = _igp.build_caption(prof)
+        raw_pic = await asyncio.to_thread(
+            _igp.download_pic, prof.get("profile_pic_url", ""))
+        if raw_pic:
+            pic, _ext = _igp.to_file_bytes(raw_pic)
+            await update.message.reply_document(
+                document=InputFile(pic, filename=f"{prof['username']}_profile{_ext}"),
+                caption=caption,
+                read_timeout=120, write_timeout=120,
+            )
+        else:
+            await update.message.reply_text(caption)
+        dossier = _igp.build_full_dossier(prof, raw_pic)
+        for i in range(0, len(dossier), 4000):
+            await update.message.reply_text(dossier[i:i + 4000])
+
+
 def main():
     # نسخه مستقیم: بدون تونل داخلی xray
     # ترافیک از VPN/فیلترشکن سیستم گوشی رد می‌شه
-    for k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        os.environ.pop(k, None)
+    # HOST FIX (Mahsa VM): keep proxy env when BOT_KEEP_PROXY=1 — this host's
+    # direct egress is intercepted, the proxy is the only working way out.
+    if os.environ.get("BOT_KEEP_PROXY") != "1":
+        for k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            os.environ.pop(k, None)
 
     _sweep_stale_downloads()
 
@@ -8254,6 +9437,11 @@ def main():
         a.add_handler(CommandHandler("mystats", _music.mystats_cmd))
         a.add_handler(CommandHandler("mstats", _music.stats_cmd))
         a.add_handler(CallbackQueryHandler(_music.on_callback, pattern=_music.MUSIC_CB_PATTERN))
+        a.add_handler(CommandHandler("igpic", ig_profile_handler))
+        a.add_handler(CommandHandler("hvkey", _hvkey_cmd))
+        a.add_handler(CommandHandler("hvfail", _hvkey_cmd))
+        a.add_handler(MessageHandler(filters.AUDIO, _harvest_capture), group=-1)
+        a.add_handler(MessageHandler(_IgProfileFilter(), ig_profile_handler))
         a.add_handler(MessageHandler(_music.music_url_filter(), _music.music_link_handler))
         a.add_handler(InlineQueryHandler(_music.on_inline))
         # ---- bridge handlers (owner-gated as before)

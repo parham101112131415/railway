@@ -17,6 +17,9 @@ if [ "${TELEGRAM_LOCAL_API:-1}" = "1" ]; then
         exit 1
     fi
     mkdir -p /var/lib/telegram-bot-api
+    if (echo > /dev/tcp/127.0.0.1/8081) 2>/dev/null; then
+        echo "[start] سرور Bot API روی 8081 از قبل بالاست — از همون استفاده می‌شه ✅"
+    else
     echo "[start] راه‌اندازی سرور محلی Bot API روی 127.0.0.1:8081 ..."
     telegram-bot-api \
         --api-id="$TELEGRAM_API_ID" \
@@ -25,6 +28,7 @@ if [ "${TELEGRAM_LOCAL_API:-1}" = "1" ]; then
         --http-port=8081 \
         --dir=/var/lib/telegram-bot-api \
         >>/tmp/botapi.log 2>&1 &
+    fi
     # صبر کن تا سرور بالا بیاد (حداکثر ۶۰ ثانیه)
     for i in $(seq 1 60); do
         if (echo > /dev/tcp/127.0.0.1/8081) 2>/dev/null; then

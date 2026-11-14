@@ -299,7 +299,9 @@ def build_caption(info, quality):
     if info.get("album"):
         lines.append(f"💿 آلبوم: {info['album']}")
     meta = []
-    if info.get("year"):
+    if info.get("release_date"):
+        meta.append(f"📅 {info['release_date']}")
+    elif info.get("year"):
         meta.append(f"📅 {info['year']}")
     if info.get("duration"):
         meta.append(f"⏱ {info['duration']}")
@@ -307,6 +309,18 @@ def build_caption(info, quality):
         meta.append(f"🔢 ترک {info['track_no']}")
     if meta:
         lines.append(" | ".join(meta))
+    extra = []
+    if info.get("genre"):
+        extra.append(f"🎼 {info['genre']}")
+    if info.get("bpm"):
+        try:
+            extra.append(f"🥁 {int(round(float(info['bpm'])))} BPM")
+        except Exception:
+            pass
+    if info.get("isrc"):
+        extra.append(f"🆔 {info['isrc']}")
+    if extra:
+        lines.append(" | ".join(extra))
     lines.append(f"🎧 کیفیت: {quality}kbps")
     return "\n".join(lines)
 
@@ -321,6 +335,10 @@ def download_mp3(query, out_mp3, quality="192", progress_cb=None, direct_url=Non
                 "--ffmpeg-location", FF, "-o", out_mp3.replace(".mp3", ".%(ext)s"),
                 "--no-playlist", "--js-runtimes", "deno,node",
                 "--newline", "--progress"]
+    # HOST FIX (Mahsa VM): same TLS-forging egress proxy as bridge_bot's
+    # BOT_NO_CHECK_CERT patch, but for this CLI subprocess.
+    if os.environ.get("BOT_NO_CHECK_CERT") == "1":
+        base_cmd.append("--no-check-certificates")
     client_variants = [
         ["--extractor-args", "youtube:player_client=ios,android"],
         ["--extractor-args", "youtube:player_client=android,web"],
@@ -368,6 +386,8 @@ def yt_flat_search(query, n=5):
            "--print", "%(title)s|%(uploader)s|%(duration_string)s|%(id)s",
            "--no-playlist", "-q", "--js-runtimes", "deno,node",
            "--extractor-args", "youtube:player_client=ios,android"]
+    if os.environ.get("BOT_NO_CHECK_CERT") == "1":
+        cmd.append("--no-check-certificates")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         out = []
@@ -402,6 +422,397 @@ def tag_mp3(path, info, cover_bytes=None):
     if cover_bytes:
         audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
     audio.save()
+
+
+# ------------------------------------------------------------ full info ----
+import time as _time
+import urllib.parse as _uparse
+
+
+def _norm_txt(s):
+    if not s:
+        return ""
+    s = str(s).lower().replace("ي", "ی").replace("ك", "ک")
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)
+    s = re.sub(r"[^a-z0-9\u0600-\u06FF ]+", " ", s)
+    return " ".join(s.split())
+
+
+def _tok_sim(a, b):
+    A, B = set(a.split()), set(b.split())
+    if not A or not B:
+        return 0.0
+    return len(A & B) / max(1, min(len(A), len(B)))
+
+
+def _best_match(cands, title, artist, get_t, get_a, get_dur=None, want_dur=None,
+                get_album=None, album=None, fallback_first=False):
+    qt, qa = _norm_txt(title), _norm_txt(artist)
+    best, best_score = None, 0.0
+    for c in cands:
+        try:
+            ts = _tok_sim(qt, _norm_txt(get_t(c)))
+            asim = _tok_sim(qa, _norm_txt(get_a(c))) if qa else 0.5
+        except Exception:
+            continue
+        score = ts * 0.7 + asim * 0.3
+        if get_album and album:
+            try:
+                if _tok_sim(_norm_txt(album), _norm_txt(get_album(c))) >= 0.6:
+                    score += 0.3
+            except Exception:
+                pass
+        if get_dur and want_dur:
+            try:
+                dd = abs(int(get_dur(c)) - int(want_dur))
+                if dd <= 2:
+                    score += 0.25
+                elif dd <= 5:
+                    score += 0.1
+            except Exception:
+                pass
+        if score > best_score:
+            best, best_score = c, score
+    if best is not None and best_score >= 0.55:
+        return best
+    # Cross-script fallback (e.g. Persian query vs Latin catalog): trust the
+    # search engine's own top hit only when the duration also lines up.
+    if fallback_first and cands and get_dur and want_dur:
+        try:
+            if abs(int(get_dur(cands[0])) - int(want_dur)) <= 3:
+                return cands[0]
+        except Exception:
+            pass
+    return None
+
+
+def _deezer_full(title, artist, want_dur=None, album=None):
+    out = {}
+    try:
+        q = _uparse.quote(f"{artist} {title}".strip())
+        d = json.loads(http_get(f"https://api.deezer.com/search?q={q}&limit=8", timeout=20).decode("utf-8", "ignore"))
+        cands = d.get("data") or []
+        if not cands:
+            return out
+        _fa = any("\u0600" <= ch <= "\u06FF" for ch in f"{artist} {title}")
+        hit = _best_match(cands, title, artist,
+                          lambda c: c.get("title"),
+                          lambda c: (c.get("artist") or {}).get("name"),
+                          lambda c: c.get("duration"), want_dur,
+                          get_album=lambda c: (c.get("album") or {}).get("title"),
+                          album=album, fallback_first=_fa)
+        if not hit:
+            return out
+        out["isrc"] = hit.get("isrc")
+        out["explicit"] = bool(hit.get("explicit_lyrics"))
+        if hit.get("rank"):
+            out["dz_rank"] = hit["rank"]
+        out["deezer_url"] = hit.get("link")
+        try:
+            tr = json.loads(http_get(f"https://api.deezer.com/track/{hit['id']}", timeout=20).decode("utf-8", "ignore"))
+            if tr.get("bpm"):
+                out["bpm"] = tr["bpm"]
+            if tr.get("gain") is not None:
+                out["gain"] = tr["gain"]
+            if tr.get("track_position"):
+                out["track_no"] = tr["track_position"]
+            if tr.get("disk_number"):
+                out["disc_no"] = tr["disk_number"]
+            if tr.get("release_date"):
+                out["release_date"] = tr["release_date"]
+            contribs = []
+            for c in tr.get("contributors") or []:
+                nm, role = c.get("name"), c.get("role")
+                if nm and role and role.lower() != "main":
+                    contribs.append(f"{nm} ({role})")
+            if contribs:
+                out["dz_contributors"] = contribs
+        except Exception:
+            pass
+        alb = hit.get("album") or {}
+        if alb.get("id"):
+            try:
+                ad = json.loads(http_get(f"https://api.deezer.com/album/{alb['id']}", timeout=20).decode("utf-8", "ignore"))
+                if ad.get("upc"):
+                    out["album_upc"] = ad["upc"]
+                if ad.get("label"):
+                    out["label"] = ad["label"]
+                gens = [g.get("name") for g in (ad.get("genres") or {}).get("data") or [] if g.get("name")]
+                if gens:
+                    out["genres"] = gens
+                if ad.get("nb_tracks"):
+                    out["album_tracks"] = ad["nb_tracks"]
+                if ad.get("fans"):
+                    out["album_fans"] = ad["fans"]
+                if ad.get("release_date"):
+                    out["release_date"] = ad["release_date"]
+                if ad.get("cover_xl"):
+                    out["cover_xl"] = ad["cover_xl"]
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("deezer full failed: %s", e)
+    return out
+
+
+def _itunes_full(title, artist, want_dur=None, album=None):
+    out = {}
+    try:
+        term = _uparse.quote(f"{artist} {title}".strip())
+        raw = http_get(f"https://itunes.apple.com/search?term={term}&entity=song&limit=8", timeout=20)
+        d = json.loads(raw.decode("utf-8", "ignore"))
+        cands = d.get("results") or []
+        if not cands:
+            return out
+        _fa = any("\u0600" <= ch <= "\u06FF" for ch in f"{artist} {title}")
+        hit = _best_match(cands, title, artist,
+                          lambda c: c.get("trackName"),
+                          lambda c: c.get("artistName"),
+                          lambda c: (c.get("trackTimeMillis") or 0) // 1000, want_dur,
+                          get_album=lambda c: c.get("collectionName"),
+                          album=album, fallback_first=_fa)
+        if not hit:
+            return out
+        if hit.get("primaryGenreName"):
+            out["genre"] = hit["primaryGenreName"]
+        if hit.get("discNumber"):
+            out["disc_no"] = hit["discNumber"]
+        if hit.get("discCount"):
+            out["disc_count"] = hit["discCount"]
+        if hit.get("trackCount"):
+            out["album_tracks"] = hit["trackCount"]
+        if hit.get("trackNumber"):
+            out["track_no"] = hit["trackNumber"]
+        ex = hit.get("trackExplicitness")
+        if ex:
+            out["explicit"] = (ex == "explicit")
+        if hit.get("releaseDate"):
+            out["release_date"] = hit["releaseDate"][:10]
+        if hit.get("trackViewUrl"):
+            out["apple_url"] = hit["trackViewUrl"]
+        art = hit.get("artworkUrl100") or ""
+        if art:
+            out["cover_xl"] = art.replace("100x100bb", "1200x1200bb")
+    except Exception as e:
+        log.warning("itunes full failed: %s", e)
+    return out
+
+
+def _mb_full(isrc):
+    out = {}
+    try:
+        d = json.loads(http_get(f"https://musicbrainz.org/ws/2/isrc/{isrc}?fmt=json", timeout=25).decode("utf-8", "ignore"))
+        recs = d.get("recordings") or []
+        if not recs:
+            return out
+        rec0 = recs[0]
+        if rec0.get("first-release-date"):
+            out["first_release"] = rec0["first-release-date"]
+        rid = rec0.get("id")
+        if not rid:
+            return out
+        _time.sleep(1.1)
+        rec = json.loads(http_get(
+            f"https://musicbrainz.org/ws/2/recording/{rid}?fmt=json&inc=artists+releases+artist-rels+work-rels",
+            timeout=25).decode("utf-8", "ignore"))
+        rels = rec.get("releases") or []
+        if rels:
+            r0 = rels[0]
+            if r0.get("country"):
+                out["release_country"] = r0["country"]
+            for li in r0.get("label-info") or []:
+                lab = (li.get("label") or {}).get("name")
+                if lab:
+                    out["label"] = lab
+                    if li.get("catalog-number"):
+                        out["catalog_no"] = li["catalog-number"]
+                    break
+        producers, engineers, performers, others = [], [], [], []
+        work_id = None
+        for r in rec.get("relations") or []:
+            if r.get("work"):
+                work_id = r["work"].get("id")
+                continue
+            nm = ((r.get("artist") or {}).get("name")) or ""
+            tp = (r.get("type") or "").lower()
+            if not nm:
+                continue
+            attrs = ", ".join(r.get("attributes") or [])
+            if tp == "producer":
+                producers.append(nm)
+            elif tp in ("engineer", "mix", "recording", "mastering"):
+                engineers.append(nm)
+            elif tp in ("instrument", "vocal", "performer"):
+                performers.append(f"{nm} ({attrs})" if attrs else nm)
+            elif tp in ("arranger", "composer", "lyricist", "writer"):
+                others.append(f"{nm} ({tp})")
+        if work_id:
+            _time.sleep(1.1)
+            wk = json.loads(http_get(
+                f"https://musicbrainz.org/ws/2/work/{work_id}?fmt=json&inc=artist-rels",
+                timeout=25).decode("utf-8", "ignore"))
+            writers = []
+            for r in wk.get("relations") or []:
+                nm = ((r.get("artist") or {}).get("name")) or ""
+                tp = (r.get("type") or "").lower()
+                if nm and tp in ("writer", "composer", "lyricist"):
+                    writers.append(nm)
+            if writers:
+                out["writers"] = list(dict.fromkeys(writers))
+        if producers:
+            out["producers"] = list(dict.fromkeys(producers))
+        if engineers:
+            out["engineers"] = list(dict.fromkeys(engineers))
+        if performers:
+            out["performers"] = list(dict.fromkeys(performers))[:10]
+        if others:
+            out["other_credits"] = list(dict.fromkeys(others))
+    except Exception as e:
+        log.warning("musicbrainz full failed: %s", e)
+    return out
+
+
+_FULL_SHARED = ("album", "year", "release_date", "label", "disc_no", "disc_count",
+                "album_tracks", "track_no", "genre", "duration")
+
+
+def _merge_full(info, src):
+    for k, v in src.items():
+        if v in (None, "", [], {}):
+            continue
+        if k in _FULL_SHARED and info.get(k):
+            continue
+        info[k] = v
+
+
+def fetch_full_info(title, artist, base=None, want_dur=None):
+    """Cross-source full metadata for a song. Merges into a copy of base.
+
+    Only fields backed by a confident match are filled; never raises.
+    """
+    info = dict(base or {})
+    info["title"] = info.get("title") or title
+    info["artist"] = info.get("artist") or artist
+    t, a = info.get("title") or "", info.get("artist") or ""
+    if want_dur is None and info.get("duration"):
+        try:
+            _m, _s = str(info["duration"]).split(":")
+            want_dur = int(_m) * 60 + int(_s)
+        except Exception:
+            want_dur = None
+    _merge_full(info, _deezer_full(t, a, want_dur, album=info.get("album")))
+    _merge_full(info, _itunes_full(t, a, want_dur, album=info.get("album")))
+    if info.get("isrc"):
+        _merge_full(info, _mb_full(info["isrc"]))
+    if info.get("genres") and not info.get("genre"):
+        info["genre"] = " / ".join(info["genres"])
+    if info.get("release_date") and not info.get("year"):
+        info["year"] = str(info["release_date"])[:4]
+    if info.get("cover_xl"):
+        info["cover_url"] = info["cover_xl"]
+    sid = (info.get("sid") or "").strip()
+    if sid.startswith("yt:"):
+        info["youtube_url"] = f"https://www.youtube.com/watch?v={sid[3:]}"
+    elif sid.startswith("sc:"):
+        if info.get("sc_url"):
+            info["soundcloud_url"] = info["sc_url"]
+    elif sid and ":" not in sid:
+        info["spotify_url"] = f"https://open.spotify.com/track/{sid}"
+    return info
+
+
+def build_dossier(info, file_meta=None):
+    NA = "---"
+
+    def v(x):
+        return NA if x in (None, "", [], {}) else str(x)
+
+    def j(lst, sep="، "):
+        return sep.join(str(x) for x in lst) if lst else NA
+
+    L = ["📋 اطلاعات کامل آهنگ", ""]
+    L.append(f"🎵 {v(info.get('artist'))} – {v(info.get('title'))}")
+    L.append(f"💿 آلبوم: {v(info.get('album'))}")
+    L.append(f"📅 تاریخ انتشار: {v(info.get('release_date') or info.get('year'))}")
+    L.append(f"🗓 اولین انتشار: {v(info.get('first_release'))}")
+    L.append(f"⏱ مدت: {v(info.get('duration'))}")
+    _tr = v(info.get('track_no')) + " از " + v(info.get('album_tracks'))
+    _dc = v(info.get('disc_no')) + " از " + v(info.get('disc_count'))
+    L.append(f"🔢 ترک {_tr} • دیسک {_dc}")
+    L.append(f"🎼 ژانر: {v(info.get('genre'))}")
+    L.append(f"🏷 لیبل: {v(info.get('label'))}")
+    L.append(f"🆔 ISRC: {v(info.get('isrc'))}")
+    L.append(f"🔖 بارکد آلبوم (UPC): {v(info.get('album_upc'))}")
+    L.append(f"📇 شماره کاتالوگ: {v(info.get('catalog_no'))}")
+    L.append(f"🌍 کشور انتشار: {v(info.get('release_country'))}")
+    _ex = info.get("explicit")
+    L.append("🔞 محتوای صریح: " + (NA if _ex is None else ("بله" if _ex else "خیر")))
+    L.append("")
+    L.append(f"✍️ ترانه‌سرا و آهنگساز: {j(info.get('writers'))}")
+    L.append(f"🎚 تهیه‌کننده: {j(info.get('producers'))}")
+    L.append(f"🎛 مهندسی و میکس: {j(info.get('engineers'))}")
+    L.append(f"🎸 نوازندگان: {j(info.get('performers'))}")
+    _oth = list(info.get("dz_contributors") or []) + list(info.get("other_credits") or [])
+    L.append(f"👥 سایر عوامل: {j(_oth)}")
+    L.append("")
+    _bpm = NA
+    if info.get("bpm"):
+        try:
+            _bpm = str(int(round(float(info["bpm"]))))
+        except Exception:
+            _bpm = NA
+    L.append(f"🥁 BPM: {_bpm}")
+    L.append(f"🔊 بلندی صدا: {v(info.get('gain'))}")
+    _rk = f"{info['dz_rank']:,}" if info.get("dz_rank") else NA
+    L.append(f"⭐ امتیاز محبوبیت: {_rk}")
+    _fn = f"{info['album_fans']:,}" if info.get("album_fans") else NA
+    L.append(f"❤️ طرفداران آلبوم: {_fn}")
+    L.append("")
+    _fm = list(file_meta or [])
+    while len(_fm) < 3:
+        _fm.append(NA)
+    L.append("🎧 فایل: " + " • ".join(_fm[:3]))
+    L.append("")
+    L.append("🔗 لینک‌ها:")
+    L.append(f"Spotify: {v(info.get('spotify_url'))}")
+    L.append(f"Deezer: {v(info.get('deezer_url'))}")
+    L.append(f"Apple Music: {v(info.get('apple_url'))}")
+    L.append(f"YouTube: {v(info.get('youtube_url'))}")
+    if info.get("soundcloud_url"):
+        L.append(f"SoundCloud: {info['soundcloud_url']}")
+    return "\n".join(L)
+
+
+def apply_full_tags(path, info):
+    """Extra ID3 frames from enriched info (genre, ISRC, writers, label, BPM, disc)."""
+    try:
+        from mutagen.mp3 import MP3
+        from mutagen.id3 import ID3, TCON, TSRC, TCOM, TPUB, TBPM, TPOS
+        audio = MP3(path, ID3=ID3)
+        if audio is None or audio.tags is None:
+            return
+
+        def put(cls, key, val):
+            if val:
+                audio.tags.delall(key)
+                audio.tags.add(cls(encoding=3, text=str(val)))
+
+        put(TCON, "TCON", info.get("genre"))
+        put(TSRC, "TSRC", info.get("isrc"))
+        if info.get("writers"):
+            put(TCOM, "TCOM", "; ".join(info["writers"]))
+        put(TPUB, "TPUB", info.get("label"))
+        if info.get("bpm"):
+            try:
+                put(TBPM, "TBPM", str(int(round(float(info["bpm"])))))
+            except Exception:
+                pass
+        if info.get("disc_no"):
+            dv = str(info["disc_no"]) + (f"/{info['disc_count']}" if info.get("disc_count") else "")
+            put(TPOS, "TPOS", dv)
+        audio.save()
+    except Exception as e:
+        log.warning("apply_full_tags failed: %s", e)
 
 
 def make_variant(in_mp3, out_mp3, tempo):
@@ -521,11 +932,8 @@ async def send_track(chat_id, info, quality, ctx, reply_to=None, extra_buttons=N
     """Download, tag, send one track. Returns True on success."""
     loop = asyncio.get_running_loop()
     cover_bytes = None
-    if info.get("cover_url"):
-        try:
-            cover_bytes = await loop.run_in_executor(None, http_get, info["cover_url"])
-        except Exception:
-            pass
+    enrich_fut = loop.run_in_executor(
+        None, lambda: fetch_full_info(info["title"], info["artist"], info))
     tmpd = tempfile.mkdtemp(prefix="spot_", dir="/tmp")
     out = os.path.join(tmpd, "song.mp3")
     status = None
@@ -545,7 +953,27 @@ async def send_track(chat_id, info, quality, ctx, reply_to=None, extra_buttons=N
                 await status.edit_text(f"🎵 {info['artist']} – {info['title']}\n✅ دانلود شد، دارم می‌فرستم…")
             except Exception:
                 pass
+        try:
+            info = await enrich_fut
+        except Exception:
+            pass
+        if info.get("cover_url"):
+            try:
+                cover_bytes = await loop.run_in_executor(None, http_get, info["cover_url"])
+            except Exception:
+                cover_bytes = None
         await loop.run_in_executor(None, lambda: tag_mp3(out, info, cover_bytes))
+        await loop.run_in_executor(None, lambda: apply_full_tags(out, info))
+        fmeta = []
+        try:
+            from mutagen.mp3 import MP3 as _MP3
+            _au = _MP3(out)
+            if _au is not None and _au.info is not None:
+                fmeta.append(f"{int(_au.info.bitrate / 1000)}kbps")
+                fmeta.append(fmt_duration(int(_au.info.length)))
+            fmeta.append(f"{os.path.getsize(out) / 1048576:.1f}MB")
+        except Exception:
+            fmeta = []
         thumb_path = None
         if cover_bytes:
             try:
@@ -576,6 +1004,11 @@ async def send_track(chat_id, info, quality, ctx, reply_to=None, extra_buttons=N
                     await ctx.bot.send_audio(chat_id=chat_id, **kwargs)
             else:
                 await ctx.bot.send_audio(chat_id=chat_id, **kwargs)
+        try:
+            for _p in chunk(build_dossier(info, fmeta), 4000):
+                await ctx.bot.send_message(chat_id=chat_id, text=_p)
+        except Exception:
+            pass
         record_download(chat_id, info.get("artist"))
         return True
     except Exception as e:
