@@ -2,7 +2,8 @@
 FROM ubuntu:24.04 AS botapi-builder
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git zlib1g-dev libssl-dev gperf \
+    build-essential cmake git zlib1g-dev libssl-dev gperf ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN git clone --recursive --depth 1 https://github.com/tdlib/telegram-bot-api.git
