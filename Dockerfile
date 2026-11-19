@@ -1,22 +1,9 @@
-# ---- Stage 1: compile telegram-bot-api from source (Debian/glibc) ----
-FROM ubuntu:24.04 AS botapi-builder
-ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git zlib1g-dev libssl-dev gperf ca-certificates \
-    && update-ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-RUN git clone --recursive --depth 1 https://github.com/tdlib/telegram-bot-api.git
-WORKDIR /src/telegram-bot-api/build
-RUN cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/botapi .. \
-    && cmake --build . --target install -j"$(nproc)" \
-    && strip /opt/botapi/bin/telegram-bot-api || true
-
-# ---- Stage 2: main app ----
+# باینری telegram-bot-api از قبل کامپایل‌شده توی botapi-bin/ هست؛ کامپایل از سورس
+# روی بیلدر Railway به سقف زمانی بیلد می‌خورد (DeadlineExceeded وسط کامپایل tdlib)
 FROM python:3.11-slim
 
 # ffmpeg برای دانلودر و برش/ادغام صدا و ویدیو لازمه
-# libssl3/zlib1g برای باینری telegram-bot-api لازمه
+# libssl3/zlib1g/libstdc++6 برای باینری telegram-bot-api لازمه
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -24,10 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     libssl3 \
     zlib1g \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 # سرور محلی Bot API (برای ارسال یک‌جای فایل‌های بالای ۵۰ مگ)
-COPY --from=botapi-builder /opt/botapi/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+COPY botapi-bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+RUN chmod +x /usr/local/bin/telegram-bot-api
 
 # جاوااسکریپت‌ رانتایم (deno) — یوتیوب این اواخر خیلی وقت‌ها بدون حل یه
 # چالش JS هیچ فرمتی برنمی‌گردونه (همون ارور «Requested format is not
